@@ -208,6 +208,9 @@ def main():
     parser.add_argument("--developer-role", choices=["system", "native", "reject"], default="system",
                         help="Explicit model adapter; system maps developer messages to system messages")
     parser.add_argument("--output-dir")
+    parser.add_argument("--no-use-cutlass-kernel", action="store_false",
+                        dest="use_cutlass_kernel",
+                        help="Use Mirage's PTX linear kernels (needed when a CUTLASS task exceeds the GPU shared-memory limit)")
     parser.add_argument("--request-timeout", type=float, default=120)
     args = parser.parse_args()
     config_keys = RunnerConfig.__dataclass_fields__

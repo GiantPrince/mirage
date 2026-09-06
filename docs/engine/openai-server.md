@@ -6,8 +6,13 @@ Launch a single-GPU persistent-kernel server:
 CUDA_VISIBLE_DEVICES=0 python -m mirage.engine.launch_server \
   --model Qwen/Qwen3-0.6B --port 8000 \
   --max-seq-length 2048 --max-num-batched-requests 4 \
-  --max-num-batched-tokens 8 --page-size 4096 --max-num-pages 16
+  --max-num-batched-tokens 8 --page-size 4096 --max-num-pages 16 \
+  --no-use-cutlass-kernel
 ```
+
+The final flag selects Mirage's PTX linear kernels. Use it on RTX A5000 GPUs,
+where the CUTLASS configuration generated for this model exceeds the device's
+shared-memory limit.
 
 `max_seq_length` covers the complete templated prompt plus generated tokens.
 The KV page pool must cover every configured concurrent sequence at maximum
@@ -100,10 +105,31 @@ GPU and releases rows through the existing completion acknowledgment protocol.
 ```bash
 python -m pytest tests/engine -q
 MIRAGE_TEST_GPUS=0,1,2,3 python -m pytest tests/engine/test_sampling_gpu.py -q
-python tests/engine/live_server_check.py
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  python tests/engine/live_server_check.py
 ```
 
 The first command runs CPU API/engine tests. GPU sampler tests compile the actual
 serving CUDA code and test probability distributions, masks, penalties, and
 batch-order-independent seeds on each selected GPU. The live check builds a
 Qwen3-0.6B runner and tests real persistent-kernel generation through HTTP.
+
+## Throughput benchmark
+
+With the server running, drive its streaming OpenAI endpoint with either a
+ShareGPT file or a repeated synthetic prompt:
+
+```bash
+python benchmark/benchmark_serving.py \
+  --url http://127.0.0.1:8000 --model Qwen/Qwen3-0.6B \
+  --synthetic-prompt "Explain why the sky is blue in one paragraph." \
+  --num-prompts 100 --max-completion-tokens 128 --rps 100 \
+  --output benchmark-results.json
+```
+
+The report includes successful request rate, exact output-token throughput from
+the API usage chunks, time to first text, inter-chunk latency, and end-to-end
+latency. The high request rate is intentional for a saturation run; lower it to
+measure latency at a chosen offered load. Run one server per visible GPU and
+load-balance across the four ports to benchmark four-replica aggregate
+throughput.

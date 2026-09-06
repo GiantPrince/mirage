@@ -14,7 +14,8 @@ def main():
     runner = ModelRunner(RunnerConfig(
         model="Qwen/Qwen3-0.6B", max_num_batched_requests=2,
         max_num_batched_tokens=8, max_seq_length=256, max_num_pages=8,
-        page_size=64, output_dir="/tmp/mirage-openai-kernel"))
+        page_size=64, output_dir="/tmp/mirage-openai-kernel",
+        use_cutlass_kernel=False))
     engine = LLMEngine(runner)
     try:
         with TestClient(create_app(engine, model=runner.config.model, request_timeout=120)) as client:

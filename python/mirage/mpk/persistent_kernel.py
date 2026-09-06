@@ -2432,7 +2432,8 @@ class PersistentKernel:
 
     def serving_sampling_layer(self, logits: DTensor, output: DTensor):
         """A shared persistent task for all ordinary autoregressive builders."""
-        scratch = self.new_tensor((1, logits.dim(1) * 3), dtype=float32,
+        # scores + two token-count arrays + block-reduction workspace
+        scratch = self.new_tensor((1, logits.dim(1) * 3 + 768), dtype=float32,
                                   name="serving_sampling_scratch")
         tb_graph = TBGraph(CyTBGraph((1, 1, 1), (128, 1, 1), 1, 64))
         for tensor in (logits, scratch, output):

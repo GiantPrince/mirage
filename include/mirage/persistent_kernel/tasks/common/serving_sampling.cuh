@@ -74,12 +74,18 @@ __device__ inline void sample(T const *logits, float *scratch, Token *output,
                               int padded_vocab, int64_t const *cfg,
                               long long const *history, int history_len,
                               int prompt_len, int generation_position) {
-  __shared__ float reduction[256];
-  __shared__ uint64_t keys[256];
+  // This function is inlined into the persistent worker kernel. That kernel
+  // already consumes the device's full dynamic shared-memory allowance, so
+  // reductions must use the task's global scratch allocation. Adding static
+  // shared memory here makes the worker launch fail on Ampere.
   int vocab = min(padded_vocab, int(cfg[2]));
   float *scores = scratch;
   int *counts = reinterpret_cast<int *>(scratch + padded_vocab);
   int *generated_counts = counts + padded_vocab;
+  float *reduction = scratch + 3 * padded_vocab;
+  // An odd vocabulary makes the preceding float regions end four-byte
+  // aligned. Round the uint64 reduction region up to eight-byte alignment.
+  uint64_t *keys = reinterpret_cast<uint64_t *>(reduction + 256 + (padded_vocab & 1));
   for (int v = threadIdx.x; v < vocab; v += blockDim.x) {
     counts[v] = 0;
     generated_counts[v] = 0;

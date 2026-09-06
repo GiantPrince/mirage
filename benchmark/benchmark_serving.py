@@ -18,7 +18,7 @@ Usage::
     # 2. Benchmark it:
     python benchmark/benchmark_serving.py \
         --url http://127.0.0.1:8000 \
-        --num-prompts 200 \
+        --model Qwen/Qwen3-8B --num-prompts 200 \
         --rps 1 \
         -o mpk_results.json
 
@@ -158,19 +158,25 @@ class BenchmarkReport:
 async def _stream_request(
     session,
     url: str,
+    model: str,
     prompt: str,
     index: int,
     temperature: float = 0.0,
+    max_completion_tokens: int = 128,
+    logit_bias_token: Optional[int] = None,
     timeout: float = 300.0,
 ) -> RequestResult:
     """Send one streaming chat-completion request, measure per-token timing."""
-    import aiohttp
-
     payload = {
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
+        "max_completion_tokens": max_completion_tokens,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
+    if logit_bias_token is not None:
+        payload["logit_bias"] = {str(logit_bias_token): 100}
 
     result = RequestResult(
         index=index, prompt=prompt, ttft=0.0,
@@ -181,22 +187,23 @@ async def _stream_request(
     first_token_ts: Optional[float] = None
     last_token_ts: Optional[float] = None
     token_count = 0
+    usage = {}
 
     try:
-        timeout_obj = aiohttp.ClientTimeout(total=timeout)
-        async with session.post(
+        async with session.stream(
+            "POST",
             f"{url}/v1/chat/completions",
             json=payload,
-            timeout=timeout_obj,
+            timeout=timeout,
         ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
+            if resp.status_code != 200:
+                body = (await resp.aread()).decode("utf-8", errors="replace")
                 result.success = False
-                result.error = f"HTTP {resp.status}: {body[:200]}"
+                result.error = f"HTTP {resp.status_code}: {body[:200]}"
                 return result
 
             buffer = ""
-            async for chunk in resp.content.iter_chunked(512):
+            async for chunk in resp.aiter_bytes(512):
                 buffer += chunk.decode("utf-8", errors="replace")
                 while "\n\n" in buffer:
                     line, buffer = buffer.split("\n\n", 1)
@@ -210,6 +217,9 @@ async def _stream_request(
                     except json.JSONDecodeError:
                         continue
 
+                    if obj.get("usage"):
+                        usage = obj["usage"]
+
                     choices = obj.get("choices", [])
                     if not choices:
                         continue
@@ -220,21 +230,16 @@ async def _stream_request(
                     if content:
                         if first_token_ts is None:
                             first_token_ts = now
-                            usage = obj.get("usage", {})
-                            result.input_tokens = usage.get("prompt_tokens", 0)
                         else:
                             result.itl.append(now - last_token_ts)
                         last_token_ts = now
                         token_count += 1
 
-        if result.input_tokens == 0:
-            result.input_tokens = len(prompt.split())
-
-        result.output_tokens = token_count
+        result.input_tokens = usage.get("prompt_tokens", len(prompt.split()))
+        result.output_tokens = usage.get("completion_tokens", token_count)
         result.total_time = time.monotonic() - t_send
         if first_token_ts is not None:
             result.ttft = first_token_ts - t_send
-        result.itl = result.itl[1:] if len(result.itl) > 1 else result.itl
 
     except asyncio.TimeoutError:
         result.success = False
@@ -277,9 +282,12 @@ def _compute_stats(values: list[float]) -> dict:
 async def _benchmark(
     url: str,
     label: str,
+    model: str,
     prompts: list[dict],
     rps: float,
     temperature: float = 0.0,
+    max_completion_tokens: int = 128,
+    logit_bias_token: Optional[int] = None,
     timeout: float = 300.0,
     warmup_count: int = 3,
 ) -> BenchmarkReport:
@@ -288,7 +296,7 @@ async def _benchmark(
     Each request is staggered by ``1/rps`` seconds, regardless of whether
     earlier requests have finished.
     """
-    import aiohttp
+    import httpx
 
     interval = 1.0 / rps
 
@@ -300,27 +308,29 @@ async def _benchmark(
     if warmup_count > 0:
         print(f"  Warming up ({warmup_count} requests)...")
         warmup_prompts = prompts[:min(warmup_count, len(prompts))]
-        connector = aiohttp.TCPConnector(limit=warmup_count + 1)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        limits = httpx.Limits(max_connections=warmup_count + 1)
+        async with httpx.AsyncClient(limits=limits) as session:
             tasks = [
-                _stream_request(session, url, p["prompt"], -1, temperature, timeout)
+                _stream_request(session, url, model, p["prompt"], -1, temperature,
+                                max_completion_tokens, logit_bias_token, timeout)
                 for p in warmup_prompts
             ]
             await asyncio.gather(*tasks)
         print("  Warmup complete.")
 
     # Main benchmark — pace requests at the target RPS
-    connector = aiohttp.TCPConnector(limit=len(prompts) + 10)
+    limits = httpx.Limits(max_connections=len(prompts) + 10)
     results: list[RequestResult] = []
     start_times: list[float] = []
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with httpx.AsyncClient(limits=limits) as session:
 
         async def _paced_request(idx: int, prompt: str, delay: float) -> RequestResult:
             await asyncio.sleep(delay)
             start_times.append(time.monotonic())
             return await _stream_request(
-                session, url, prompt, idx, temperature, timeout,
+                session, url, model, prompt, idx, temperature,
+                max_completion_tokens, logit_bias_token, timeout,
             )
 
         tasks = []
@@ -438,9 +448,13 @@ def _print_report(report: BenchmarkReport) -> None:
 
 async def main_async(args: argparse.Namespace) -> None:
     # 1. Load dataset
-    print("Loading ShareGPT dataset...")
-    all_prompts = load_sharegpt(args.dataset_path)
-    print(f"  Loaded {len(all_prompts)} prompts")
+    if args.synthetic_prompt is not None:
+        all_prompts = [{"prompt": args.synthetic_prompt}] * args.num_prompts
+        print(f"Using {len(all_prompts)} synthetic prompts")
+    else:
+        print("Loading ShareGPT dataset...")
+        all_prompts = load_sharegpt(args.dataset_path)
+        print(f"  Loaded {len(all_prompts)} prompts")
 
     if args.max_prompt_tokens > 0:
         all_prompts = [p for p in all_prompts
@@ -456,7 +470,7 @@ async def main_async(args: argparse.Namespace) -> None:
     parsed = urlparse(args.url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     try:
-        urllib.request.urlopen(f"{base_url}/docs", timeout=5)
+        urllib.request.urlopen(f"{base_url}/health", timeout=5)
     except Exception:
         print(f"Error: Cannot reach {base_url} — is the server running?")
         sys.exit(1)
@@ -466,9 +480,12 @@ async def main_async(args: argparse.Namespace) -> None:
     report = await _benchmark(
         url=args.url,
         label=label,
+        model=args.model,
         prompts=prompts,
         rps=args.rps,
         temperature=args.temperature,
+        max_completion_tokens=args.max_completion_tokens,
+        logit_bias_token=args.logit_bias_token,
         timeout=args.timeout,
         warmup_count=min(args.warmup, num_prompts),
     )
@@ -531,9 +548,13 @@ def main() -> None:
                         help="Serving endpoint URL (default: http://127.0.0.1:8000)")
     parser.add_argument("--label", default="",
                         help="Label for this benchmark run (default: use --url)")
+    parser.add_argument("--model", default="Qwen/Qwen3-8B",
+                        help="Model name sent in each OpenAI request")
 
     parser.add_argument("--dataset-path", default=None,
                         help="Local path to ShareGPT JSON (downloads from HF if omitted)")
+    parser.add_argument("--synthetic-prompt", default=None,
+                        help="Use this prompt repeatedly instead of loading ShareGPT")
     parser.add_argument("--num-prompts", type=int, default=200,
                         help="Number of prompts to benchmark (default: 200)")
     parser.add_argument("--max-prompt-tokens", type=int, default=128,
@@ -543,6 +564,10 @@ def main() -> None:
                         help="Requests per second (default: 1.0)")
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature (default: 0.0)")
+    parser.add_argument("--max-completion-tokens", type=int, default=128,
+                        help="Output-token budget for each request (default: 128)")
+    parser.add_argument("--logit-bias-token", type=int, default=None,
+                        help="Force this token ID with logit bias 100 for fixed-length microbenchmarks")
     parser.add_argument("--timeout", type=float, default=7200.0,
                         help="Per-request timeout in seconds (default: 7200)")
     parser.add_argument("--warmup", type=int, default=3,
@@ -552,6 +577,8 @@ def main() -> None:
                         help="Save results to JSON file")
 
     args = parser.parse_args()
+    if args.rps <= 0 or args.num_prompts <= 0 or args.max_completion_tokens <= 0:
+        parser.error("--rps, --num-prompts, and --max-completion-tokens must be positive")
 
     import warnings
     warnings.filterwarnings("ignore", message=".*Unclosed.*")
