@@ -48,3 +48,21 @@ def test_tool_validation():
     ChatRequest(model="m", messages=[
         {"role": "assistant", "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "a", "content": "ok"}])
+
+
+def test_top_k_large_value_is_normalized():
+    assert SamplingParams(top_k=2**64).pack(1, 10, 100, [2])[5] == 100
+
+
+def test_developer_adapter_and_unsupported_tools():
+    class Tokenizer:
+        chat_template = "basic"
+        def apply_chat_template(self, messages, **kwargs):
+            assert messages == [{"role": "system", "content": "instruction"}]
+            return [1]
+    assert TokenizerManager(Tokenizer(), "system").tokenize_messages(
+        [{"role": "developer", "content": "instruction"}]) == [1]
+    with pytest.raises(ValueError, match="adapter"):
+        TokenizerManager(Tokenizer()).tokenize_messages([{"role": "developer", "content": "instruction"}])
+    with pytest.raises(ValueError, match="tool-call history"):
+        TokenizerManager(Tokenizer()).tokenize_messages([{"role": "tool", "content": "ok"}])

@@ -602,7 +602,7 @@ __device__ __forceinline__ bool
     int num_new_pages =
         (step + num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
     config.paged_kv_last_page_len_buffer[num_reqs] =
-        (step + num_new_tokens) % MPK_PAGE_SIZE;
+        (step + num_new_tokens - 1) % MPK_PAGE_SIZE + 1;
 
     for (int j = 0; j < num_old_pages; j++) {
       config.paged_kv_indices_buffer[num_pages + j] =
@@ -674,7 +674,7 @@ __device__ __forceinline__ bool
     int num_new_pages =
         (initial_step + num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
     config.paged_kv_last_page_len_buffer[num_reqs] =
-        (initial_step + num_new_tokens) % MPK_PAGE_SIZE;
+        (initial_step + num_new_tokens - 1) % MPK_PAGE_SIZE + 1;
 
     for (int j = 0; j < num_new_pages; j++) {
       config.paged_kv_indices_buffer[num_pages + j] =
@@ -1468,7 +1468,7 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[8]: paged_kv_indices_buffer
 // meta_tensors[9]: paged_kv_last_page_len_buffer
 // meta_tensors[10]: paged_kv_indices_snapshot
-// MODE_ONLINE_PINNED only (indices 11..22):
+// MODE_ONLINE_PINNED only (indices 11..26):
 // meta_tensors[11]: pinned_req_ready
 // meta_tensors[12]: pinned_req_request_id
 // meta_tensors[13]: pinned_req_prompt_len
@@ -1481,6 +1481,10 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[20]: pinned_step
 // meta_tensors[21]: pinned_inbox_tokens
 // meta_tensors[22]: pinned_rid_at_row
+// meta_tensors[23]: pinned_generation_config
+// meta_tensors[24]: generation_config
+// meta_tensors[25]: pinned_cancel
+// meta_tensors[26]: pinned_finish_reason
 
 extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
@@ -1508,7 +1512,7 @@ extern "C" void
     global_model_tensors[model_tensor_names[i]] = model_tensor_ptrs[i];
   }
   // meta_tensors[0..10] are always required.
-  // meta_tensors[11..22]: pinned ring pointers (MODE_ONLINE_PINNED only,
+  // meta_tensors[11..26]: pinned ring and generation pointers (MODE_ONLINE_PINNED only,
   //   passed as CPU-side void* from Python's pinned tensors)
 #if defined(MODE_ONLINE_PINNED)
   assert(meta_tensors.size() == 27);

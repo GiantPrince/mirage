@@ -45,6 +45,21 @@ class RunnerConfig:
     """Directory for compiled kernel artefacts; ``None`` uses a temp dir."""
 
     use_cutlass_kernel: bool = True
+    max_pending_requests: int = 128
+    developer_role: str = "system"
+
+    def __post_init__(self):
+        import math
+        if min(self.max_num_batched_requests, self.max_num_batched_tokens,
+               self.max_seq_length, self.max_num_pages, self.page_size,
+               self.max_pending_requests) <= 0:
+            raise ValueError("capacity limits must be positive")
+        if self.pinned_ring_capacity <= 0 or self.pinned_ring_capacity & (self.pinned_ring_capacity - 1):
+            raise ValueError("pinned_ring_capacity must be a power of two")
+        if self.max_num_pages < self.max_num_batched_requests * math.ceil(self.max_seq_length / self.page_size):
+            raise ValueError("KV page pool must cover the configured maximum concurrent sequences")
+        if self.developer_role not in ("native", "system", "reject"):
+            raise ValueError("invalid developer role adapter")
 
 
 # ── ModelRunner ───────────────────────────────────────────────────────────────
@@ -96,6 +111,17 @@ class ModelRunner:
         self.mpk.build()
         self.runtime = OnlinePinnedRuntime(self.mpk)
         self.tokenizer = self.mpk.tokenizer
+        self.vocab_size = self.mpk.model_builder.vocab_size
+        model_config = getattr(getattr(self.mpk.model_builder, "model", None), "config", None)
+        context_limit = getattr(model_config, "max_position_embeddings", config.max_seq_length)
+        if config.max_seq_length > context_limit:
+            raise ValueError("configured context capacity exceeds the model position limit")
+        generation_config = getattr(getattr(self.mpk.model_builder, "model", None), "generation_config", None)
+        eos = getattr(generation_config, "eos_token_id", None)
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+        self.eos_ids = list(dict.fromkeys(eos if isinstance(eos, list) else [eos]))
+        self.eos_ids = [token for token in self.eos_ids if token is not None]
         self.mpk.compile(output_dir=config.output_dir)
 
     # ── Execution ─────────────────────────────────────────────────────────────

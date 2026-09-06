@@ -484,7 +484,7 @@ class MPK:
         model_builder_class = get_builder(self.model_name)
         self.model_builder = model_builder_class(self.persistent_kernel)
         if self.weight_from_model:
-            self.model_builder.build_from_model(model_name=self.model_name, model_path=self.model_path)
+            self.model_builder.build_from_model(model_name=self.model_name, model_path=self.metadata.model_path)
             self.tokenizer = self.model_builder.tokenizer
         else:
             self.model_builder.build_from_config(self.model_config)

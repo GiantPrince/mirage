@@ -71,7 +71,7 @@ class OnlinePinnedRuntime:
 
         # CPU-side waiting queue: holds (rid, token_ids, initial_step) tuples
         # that could not be written to the ring because it was full.
-        self._waiting: Deque[Tuple[int, torch.Tensor, int]] = collections.deque()
+        self._waiting: Deque[Tuple[int, torch.Tensor, int, torch.Tensor]] = collections.deque()
         self._waiting_lock = threading.Lock()
 
         # Dedicated stream for HtoD / DtoH copies.
@@ -303,18 +303,26 @@ class OnlinePinnedRuntime:
     def finish_reason(self, row: int) -> str:
         return {1: "stop", 2: "length", 3: "cancelled"}.get(int(self._finish_reason[row]), "length")
 
-    def cancel_request(self, rid: int) -> None:
-        """Cancel admitted or queued work; its completion still must be acknowledged."""
+    def cancel_request(self, rid: int) -> bool:
+        """Return True if removed before publication, otherwise await GPU completion."""
+        with self._ring_lock:
+            with self._waiting_lock:
+                for request in self._waiting:
+                    if request[0] == rid:
+                        self._waiting.remove(request)
+                        return True
         with self._lock:
             if rid not in self._completions:
                 self._cancelled.add(rid)
                 row = self.find_row_for_rid(rid)
                 if row >= 0:
                     self._store_i32_release(self._cancel, row, rid)
+        return False
 
     def abandon_request(self, rid: int) -> None:
         """Release *rid* when it completes without retaining its output."""
-        self.cancel_request(rid)
+        if self.cancel_request(rid):
+            return
         with self._lock:
             completion = self._completions.get(rid)
             if completion is None:

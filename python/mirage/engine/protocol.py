@@ -86,6 +86,12 @@ class CompletionRequest(APIModel):
         if self.max_tokens is not None and self.max_completion_tokens is not None:
             if self.max_tokens != self.max_completion_tokens:
                 raise ValueError("max_tokens and max_completion_tokens conflict")
+        try:
+            repetition = struct.unpack("f", struct.pack("f", self.repetition_penalty))[0]
+        except OverflowError as exc:
+            raise ValueError("repetition_penalty must fit a positive finite float32") from exc
+        if repetition == 0 or not math.isfinite(repetition):
+            raise ValueError("repetition_penalty must fit a positive finite float32")
         stops = [self.stop] if isinstance(self.stop, str) else self.stop or []
         if len(stops) > 4 or any(not s for s in stops):
             raise ValueError("stop must contain one to four nonempty strings")
@@ -169,7 +175,7 @@ class SamplingParams:
             return struct.unpack("q", struct.pack("d", value))[0]
         words = [0] * CONFIG_WORDS
         words[:11] = [budget, self.seed, vocab_size, bits(self.temperature), bits(self.top_p),
-                      self.top_k, bits(self.frequency_penalty), bits(self.presence_penalty),
+                      min(self.top_k, vocab_size), bits(self.frequency_penalty), bits(self.presence_penalty),
                       bits(self.repetition_penalty), len(eos_ids), len(self.logit_bias)]
         words[16:16 + len(eos_ids)] = eos_ids
         for i, (token, bias) in enumerate(sorted(self.logit_bias.items())):

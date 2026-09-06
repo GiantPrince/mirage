@@ -14,6 +14,10 @@ class TokenizerManager:
 
     def tokenize_messages(self, messages: list[dict]) -> list[int]:
         messages = copy.deepcopy(messages)
+        if any(m["role"] == "tool" or m.get("tool_calls") for m in messages):
+            template = self._tokenizer.chat_template
+            if not isinstance(template, str) or "tool_calls" not in template:
+                raise ValueError("model chat template does not support tool-call history")
         for message in messages:
             if message["role"] == "developer" and self.developer_role != "native":
                 if self.developer_role == "reject":

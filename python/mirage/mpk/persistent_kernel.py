@@ -3096,6 +3096,10 @@ class PersistentKernel:
             "pinned_step",
             "pinned_inbox_tokens",
             "pinned_rid_at_row",
+            "pinned_generation_config",
+            "generation_config",
+            "pinned_cancel",
+            "pinned_finish_reason",
         ]
         meta_tensors_ptr = []
         for key in expected_order:

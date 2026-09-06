@@ -76,3 +76,11 @@ def test_greedy_penalties_and_seed(sampler, device):
     assert (first != sampler(device, [1., 2., 3.], params, position=10)).any()
     # Equal-score top-k ties prefer the lower token ID.
     assert set(sampler(device, [1., 1., 1.], [SamplingParams(temperature=1, top_k=1)]*10)) == {0}
+
+
+@pytest.mark.parametrize("device", GPUS or [0])
+def test_tiny_nucleus_and_masked_logits(sampler, device):
+    params = [SamplingParams(temperature=1, top_p=1e-100, seed=i) for i in range(8)]
+    assert set(sampler(device, [1., 3., 2.], params)) == {1}
+    params = [SamplingParams(temperature=1, seed=i) for i in range(8)]
+    assert set(sampler(device, [-np.inf, 0., -np.inf], params)) == {1}
