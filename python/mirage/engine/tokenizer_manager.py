@@ -12,6 +12,17 @@ class TokenizerManager:
         self._tokenizer = tokenizer
         self._lock = threading.Lock()
 
+    def tokenize_messages(self, messages: list[dict]) -> list[int]:
+        with self._lock:
+            if not self._tokenizer.chat_template:
+                raise ValueError("model tokenizer has no chat template")
+
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True
+            )
+
     def tokenize(self, prompt: str, use_template: bool = True) -> list[int]:
         """Apply chat template (if requested) and return token IDs."""
         if use_template:
@@ -34,5 +45,4 @@ class TokenizerManager:
 
     def decode_single(self, token_id: int) -> str:
         """Decode a single token ID to text."""
-        with self._lock:
-            return self._tokenizer.decode([token_id], skip_special_tokens=True)
+        return self.decode([token_id])
