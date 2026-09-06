@@ -2376,6 +2376,9 @@ class PersistentKernel:
         block_dim: tuple,
         vocab_size: int = None,
     ):
+        if self.mode == "online_pinned":
+            self._serving_logits = input
+            return
         # Currently assume that input/output
         assert input.num_dims == 2  # (batch_size, vocab_size)
         assert len(output) == 2
@@ -2404,6 +2407,9 @@ class PersistentKernel:
         grid_dim: tuple,
         block_dim: tuple,
     ):
+        if self.mode == "online_pinned":
+            self.serving_sampling_layer(self._serving_logits, output)
+            return
         # Currently assume that input/output
         assert len(input) == 2
         input_value, input_index = input
@@ -2423,6 +2429,16 @@ class PersistentKernel:
             self.kn_graph.register_task(
                 tb_graph, "argmax_reduce", [self.argmax_partial_output_size]
             )
+
+    def serving_sampling_layer(self, logits: DTensor, output: DTensor):
+        """A shared persistent task for all ordinary autoregressive builders."""
+        scratch = self.new_tensor((1, logits.dim(1) * 3), dtype=float32,
+                                  name="serving_sampling_scratch")
+        tb_graph = TBGraph(CyTBGraph((1, 1, 1), (128, 1, 1), 1, 64))
+        for tensor in (logits, scratch, output):
+            tb_graph.new_input(tensor, (-1, -1, -1), -1, True)
+        self.kn_graph.customized([logits, scratch, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "sampling_sm100", [])
 
     def sampling_sm100_layer(
         self,
@@ -3205,6 +3221,11 @@ class PersistentKernel:
             meta_tensors.append(self.meta_tensors["pinned_step"])
             meta_tensors.append(self.meta_tensors["pinned_inbox_tokens"])
             meta_tensors.append(self.meta_tensors["pinned_rid_at_row"])
+            meta_tensors.append(self.meta_tensors["pinned_generation_config"])
+            meta_tensors.append(self.meta_tensors["generation_config"])
+            meta_tensors.append(self.meta_tensors["pinned_cancel"])
+            meta_tensors.append(self.meta_tensors["pinned_finish_reason"])
+
         meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
         profiler_buffer_ptr = (
             self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0

@@ -413,6 +413,10 @@ struct RuntimeConfig {
   // allocating a buffer row so CPU can discover which row its request is
   // on by scanning rows, then poll pinned_step[row] for per-step streaming.
   int32_t volatile *pinned_rid_at_row; // [total_inflight], pinned
+  int64_t *pinned_generation_config; // [ring_capacity, 544], immutable until admitted
+  int64_t *generation_config; // [max_requests, 544], indexed by buffer row
+  int32_t volatile *pinned_cancel; // cancellation request ID, not a reusable boolean
+  int32_t *pinned_finish_reason; // row: 1=stop, 2=length, 3=cancelled
   // Running queue rid tracking: request_rids[i] stores the original rid
   // for active batch slot i (GPU device memory).
   int *request_rids; // [MPK_MAX_NUM_BATCHED_REQUESTS]

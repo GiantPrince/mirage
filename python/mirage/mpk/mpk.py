@@ -68,6 +68,10 @@ class MPKMetadata:
     pinned_step: Optional[torch.Tensor] = None
     pinned_inbox_tokens: Optional[torch.Tensor] = None
     pinned_rid_at_row: Optional[torch.Tensor] = None
+    pinned_generation_config: Optional[torch.Tensor] = None
+    generation_config: Optional[torch.Tensor] = None
+    pinned_cancel: Optional[torch.Tensor] = None
+    pinned_finish_reason: Optional[torch.Tensor] = None
     # spec decode config
     spec_decode: Optional[str] = None
     spec_decode_config: Optional[object] = None
@@ -227,6 +231,22 @@ class MPK:
             self.num_schedulers = args.num_schedulers
         print(f"num_workers: {self.num_workers}, num_schedulers: {self.num_schedulers}")
         # init meta tensors
+        # Versioned serving settings: ring payload is copied into private row state.
+        if args.mode == "online_pinned":
+            shapes = [(args.pinned_ring_capacity, 544), (args.max_num_batched_requests, 544),
+                      (args.max_num_batched_requests,), (args.max_num_batched_requests,)]
+            for name, shape in zip(
+                    ("pinned_generation_config", "generation_config", "pinned_cancel", "pinned_finish_reason"), shapes):
+                tensor = getattr(args, name)
+                if tensor is None:
+                    dtype = torch.int64 if len(shape) == 2 else torch.int32
+                    tensor = torch.zeros(shape, dtype=dtype, device="cuda" if name == "generation_config" else "cpu")
+                    if name.startswith("pinned_"):
+                        tensor = tensor.pin_memory()
+                    if name == "pinned_cancel":
+                        tensor.fill_(-1)
+                    setattr(args, name, tensor)
+                setattr(self, name, tensor)
         meta_tensors = {
             "step": self.step,
             "tokens": self.tokens,
@@ -253,6 +273,11 @@ class MPK:
             "pinned_step":             args.pinned_step,
             "pinned_inbox_tokens":     args.pinned_inbox_tokens,
             "pinned_rid_at_row":       args.pinned_rid_at_row,
+            "pinned_generation_config": args.pinned_generation_config,
+            "generation_config": args.generation_config,
+            "pinned_cancel": args.pinned_cancel,
+            "pinned_finish_reason": args.pinned_finish_reason,
+
         }
         self.persistent_kernel = PersistentKernel(
             mode=args.mode,
@@ -273,7 +298,7 @@ class MPK:
             use_cutlass_kernel=args.use_cutlass_kernel,
             pinned_ring_capacity=args.pinned_ring_capacity,
         )
-        self.meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors.values()]
+        self.meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors.values() if tensor is not None]
         self.profiler_buffer_ptr = (
             self.persistent_kernel.profiler_tensor.data_ptr() if self.persistent_kernel.profiler_tensor is not None else 0
         )
@@ -459,7 +484,7 @@ class MPK:
         model_builder_class = get_builder(self.model_name)
         self.model_builder = model_builder_class(self.persistent_kernel)
         if self.weight_from_model:
-            self.model_builder.build_from_model(model_name=self.model_name)
+            self.model_builder.build_from_model(model_name=self.model_name, model_path=self.model_path)
             self.tokenizer = self.model_builder.tokenizer
         else:
             self.model_builder.build_from_config(self.model_config)
