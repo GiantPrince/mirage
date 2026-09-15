@@ -52,6 +52,8 @@
 #include "tasks/ampere/task_header.cuh"
 #endif
 
+#include "tasks/common/serving_sampling.cuh"
+
 using bfloat16 = type::bfloat16_t;
 using namespace mirage::runtime;
 // Configurations for the MPK runtime
@@ -516,6 +518,8 @@ __device__ __forceinline__ bool
                 ((config.tokens[row * MPK_MAX_SEQ_LENGTH + step + num_tokens] ==
                   config.eos_token_id) &&
                  (step + num_tokens >= prompt_len));
+    int generated = max(0, step + num_tokens - prompt_len + 1);
+    int64_t const *settings = 
 #endif
 
     if (done) {
@@ -1542,6 +1546,14 @@ extern "C" void
       static_cast<int64_t *>(meta_tensors[21]);
   global_runtime_config.pinned_rid_at_row =
       static_cast<int32_t volatile *>(meta_tensors[22]);
+  global_runtime_config.pinned_generation_config = 
+      static_cast<int64_t *>(meta_tensors[23]);
+  global_runtime_config.generation_config = 
+      static_cast<int64_t *>(meta_tensors[24]);
+  global_runtime_config.pinned_cancel = 
+      static_cast<int32_t volatile *>(meta_tensors[25]);
+  global_runtime_config.pinned_finish_reason = 
+      static_cast<int32_t *>(meta_tensors[26]);
 #endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;

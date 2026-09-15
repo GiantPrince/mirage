@@ -416,6 +416,10 @@ struct RuntimeConfig {
   // Running queue rid tracking: request_rids[i] stores the original rid
   // for active batch slot i (GPU device memory).
   int *request_rids; // [MPK_MAX_NUM_BATCHED_REQUESTS]
+  int64_t *pinned_generation_config; // [ring_capacity, 544], immutable until admitted
+  int64_t *generation_config; // [max_requests, 544], indexed by buffer row
+  int32_t volatile *pinned_cancel; // cancellation request ID
+  int32_t *pinned_finish_reason; // row: 1=stop, 2=length, 3=cancelled
   // Free row pool — stack of available buffer row indices (GPU device
   // memory).  Sized for max_num_batched_requests (no GPU waiting queue).
   int *free_rows;    // [MPK_MAX_NUM_BATCHED_REQUESTS]

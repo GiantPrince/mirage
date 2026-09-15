@@ -12,6 +12,7 @@ import torch.distributed as dist
 from ..mpk.mpk import MPK, MPKMetadata
 from ..mpk import OnlinePinnedRuntime
 from ..mpk.models.graph_builder import MirageModelConfig
+from  protocol import CONFIG_WORDS
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -182,4 +183,8 @@ class ModelRunner:
             pinned_step=torch.zeros(n_req, dtype=torch.int32).pin_memory(),
             pinned_inbox_tokens=torch.zeros(cap, config.max_seq_length, dtype=torch.int64).pin_memory(),
             pinned_rid_at_row=torch.full((n_req,), -1, dtype=torch.int32).pin_memory(),
+            pinned_generation_config=torch.zeros((cap, CONFIG_WORDS), dtype=torch.int64).pin_memory(),
+            generation_config=torch.zeros((n_req, CONFIG_WORDS), dtype=torch.int64).pin_memory(),
+            pinned_cancel=torch.full(n_req, -1, dtype=torch.int32, pin_memory=True),
+            pinned_finish_reason=torch.zeros(n_req, dtype=torch.int32, pin_memory=True)
         )

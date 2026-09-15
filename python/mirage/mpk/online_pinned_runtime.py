@@ -90,9 +90,14 @@ class OnlinePinnedRuntime:
         self._drain_thread: threading.Thread | None = None
         self._drain_error: Exception | None = None
 
+        self._generation_config = mpk.pinned_generation_config
+        self._cancel = mpk.pinned_cancel
+        self._finish_reason = mpk.pinned_finish_reason
+        self._cancelled: set[int] = set()
+
     # ── Public API ────────────────────────────────────────────────────────
 
-    def submit(self, rid: int, token_ids: torch.Tensor, initial_step: int = 0) -> bool:
+    def submit(self, rid: int, token_ids: torch.Tensor, initial_step: int = 0, generation_config=None) -> bool:
         """Stage prompt tokens and write a request into the CPU→GPU ring.
 
         Writes tokens to the slot-specific inbox so concurrent requests never
@@ -111,6 +116,12 @@ class OnlinePinnedRuntime:
         the CPU waiting deque.
         """
         self._raise_drain_error()
+        if generation_config is None:
+            from ..engine.protocol import SamplingParams
+            vocab = getattr(self._mpk.model_builder, "vocab_size", len(self._mpk.tokenizer))
+            generation_config = SamplingParams().pack(len(token_ids), self._inbox_tokens.shape[1], vocab,
+                                                     [self._mpk.persistent_kernel.eos_token_id])
+        generation_config = torch.tensor(generation_config, dtype=torch.int64)
 
         # Keep the producer lock until ready=1 is published. Otherwise a
         # flusher can reserve a later slot and leave a permanent hole in the
@@ -120,9 +131,9 @@ class OnlinePinnedRuntime:
             if self._load_i32_acquire(self._req_ready, slot) != 0:
                 # Ring full — enqueue to CPU-side waiting.
                 with self._waiting_lock:
-                    self._waiting.append((rid, token_ids.clone(), initial_step))
+                    self._waiting.append((rid, token_ids.clone(), initial_step, generation_config))
                 return False
-            self._publish_request_locked(slot, rid, token_ids, initial_step)
+            self._publish_request_locked(slot, rid, token_ids, initial_step, generation_config)
             self._cpu_req_tail += 1
         return True
 
@@ -142,9 +153,9 @@ class OnlinePinnedRuntime:
                     return 0
                 request = self._waiting.popleft()
 
-            rid, token_ids, initial_step = request
+            rid, token_ids, initial_step, generation_config = request
             try:
-                self._publish_request_locked(slot, rid, token_ids, initial_step)
+                self._publish_request_locked(slot, rid, token_ids, initial_step, generation_config)
             except Exception:
                 with self._waiting_lock:
                     self._waiting.appendleft(request)
@@ -158,6 +169,7 @@ class OnlinePinnedRuntime:
         rid: int,
         token_ids: torch.Tensor,
         initial_step: int,
+        generation_config: torch.Tensor
     ) -> None:
         """Copy and publish one request while ``_ring_lock`` is held."""
         prompt_len = token_ids.shape[0]
@@ -165,6 +177,7 @@ class OnlinePinnedRuntime:
             self._inbox_tokens[slot, :prompt_len].copy_(
                 token_ids, non_blocking=True)
         self._write_stream.synchronize()
+        self._generation_config[slot].copy_(generation_config)
         self._req_request_id[slot] = rid
         self._req_prompt_len[slot] = prompt_len
         self._req_initial_step[slot] = initial_step
@@ -178,6 +191,11 @@ class OnlinePinnedRuntime:
         """
         self._raise_drain_error()
         finished = []
+        with self._lock:
+            for rid in self._cancelled:
+                row = self.find_row_for_rid(rid)
+                if row >= 0:
+                    self._store_i32_release(self._cancel, row, rid)
         while True:
             with self._lock:
                 slot = self._cpu_comp_head & self._mask
@@ -186,6 +204,7 @@ class OnlinePinnedRuntime:
                 rid         = int(self._comp_request_id[slot].item())
                 buffer_row  = int(self._comp_buffer_row[slot].item())
                 final_step  = int(self._comp_final_step[slot].item())
+                self._cancelled.discard(rid)
                 if rid in self._abandoned:
                     self._release_row_locked(rid, buffer_row)
                     self._abandoned.remove(rid)
@@ -286,6 +305,9 @@ class OnlinePinnedRuntime:
             self._release_row_locked(rid, buffer_row)
             del self._completions[rid]
 
+    def finish_reason(self, row: int) -> str:
+        return { 1: "stop", 2: "length", 3: "cancelled"}.get(int(self._finish_reason[row]), "length")
+    
     def _release_row_locked(self, rid: int, buffer_row: int) -> None:
         owner = self._load_i32_acquire(self._pinned_rid_at_row, buffer_row)
         if owner != rid:
@@ -358,6 +380,9 @@ class OnlinePinnedRuntime:
             self._cpu_comp_head = 0
             self._completions.clear()
             self._abandoned.clear()
+            self._cancelled.clear()
+            self._cancel.fill(-1)
+            self._finish_reason.zero_()
             self._drain_error = None
             self._comp_ready.zero_()
 
