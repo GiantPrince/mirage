@@ -19,28 +19,66 @@ from typing import AsyncGenerator
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .model_runner import ModelRunner, RunnerConfig
 from .llm_engine import LLMEngine
 
 
+
+def error_response(message, status=400, param=None, code=None):
+    return JSONResponse(
+        status_code=status, 
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error" if status < 500 else "server_error",
+                "param": param,
+                "code": code
+            }
+        }
+    )
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    config: RunnerConfig = app.state.runner_config
-    runner = ModelRunner(config)
-    engine = LLMEngine(runner)
+    from .model_runner import ModelRunner
+    from .llm_engine import LLMEngine
+    app.state.engine = LLMEngine(ModelRunner(app.state.runner_config))
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(app.state.engine.close)
+
+def create_app(engine=None, *, model=None, request_timeout=None, config=None):
+    app = FastAPI(title="Mirage OpenAI API", lifespan=lifespan if engine is None else None)
     app.state.engine = engine
-    yield
-    engine.close()
+    app.state.served_model = model
+    app.state.server_config = config or ServerConfig(request_timeout=request_timeout)
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.get("/v1/models")
+    async def models():
+        return {"object": "list", "data": [{"id": app.state.served_model, "object": "model", "created": 0, "owned_by": "mirage"}]}
+
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request):
+        return await complete(request, chat=True)
+
+    @app.post("v1/completions")
+    async def text(request: Request):
+        return await complete(request, chat=True)
+
+    return app
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
-app = FastAPI(title="MPK LLM Engine", lifespan=lifespan)
+app = create_app()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
