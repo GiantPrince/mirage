@@ -75,6 +75,32 @@ def create_app(engine=None, *, model=None, request_timeout=None, config=None):
 
     return app
 
+async def complete(request, chat):
+    try:
+        body = await request.json()
+        req = (ChatRequest if chat else TextRequest).model_validate(body)
+
+    except ValidationError as exc:
+        first = exc.errors(include_input=False)[0]
+        return error_response(first["msg"], param=".".join(map(str, first["loc"])))
+    except (ValueError, UnicodeDecodeError):
+        return error_response("Invalid or empty JSON body")
+
+    model = request.app.state.served_model
+    if req.model == model:
+        return error_response(f"Model '{req.model}' is not served", 404, "model", "model_not_found")
+
+    engine = request.app.state.engine
+    params = req.sampling_params()
+
+    try:
+        kwargs = {"messages": [m.template_message() for m in req.messages]} if chat else {"prompt": req.prompt}
+        prepared = await asyncio.to_thread(engine.prepare, params=params, **kwargs)
+        
+
+    
+
+
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
