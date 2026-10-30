@@ -35,6 +35,7 @@ cdef extern from "mirage/persistent_kernel/serving_config.h" namespace "mirage::
     cdef int FINISH_STOP
     cdef int FINISH_LENGTH
     int sampling_scratch_words(int vocab)
+    int parallel_sampling_scratch_words(int vocab, int parts)
     void pack_config(ServingConfig *out, int64_t budget, int64_t seed, int64_t vocab,
                      double temperature, double top_p, int64_t top_k,
                      double frequency, double presence, double repetition,
@@ -53,6 +54,9 @@ def serving_max_biases():
 
 def serving_scratch_words(int vocab):
     return sampling_scratch_words(vocab)
+
+def serving_parallel_scratch_words(int vocab, int parts):
+    return parallel_sampling_scratch_words(vocab, parts)
 
 def serving_finish_reason_name(int reason):
     if reason == FINISH_NONE:

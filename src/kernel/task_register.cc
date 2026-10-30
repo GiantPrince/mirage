@@ -2515,17 +2515,21 @@ int TaskRegister::register_argmax_reduce_sm100_task(
   return register_task_variant(TASK_ARGMAX_REDUCE_SM100, code.to_string());
 }
 
-int TaskRegister::register_serving_sampling_task(threadblock::Graph const &bgraph) {
-  assert(bgraph.operators.size() == 3);
+int TaskRegister::register_serving_sampling_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 2);
+  int phase = params[0], parts = params[1];
   auto *input = static_cast<tb::TBInputOp *>(bgraph.operators[0]);
   auto logits = input->output_tensors[0];
-  assert(logits.num_dims == 2);
   mirage::transpiler::CodeKeeper code;
-  code.e("mirage::serving::sample_request<WORKER_NUM_THREADS>(");
+  code.e("mirage::serving::sample_request<WORKER_NUM_THREADS, $>(", phase);
   code.e("    static_cast<bfloat16 const *>(task_desc->input_ptrs[0]),");
   code.e("    static_cast<float *>(task_desc->input_ptrs[1]),");
+  code.e("    static_cast<float *>(task_desc->input_ptrs[2]),");
   code.e("    static_cast<long long *>(task_desc->output_ptrs[0]),");
-  code.e("    $, task_desc->task_metadata.request_id, runtime_config);", logits.dim[1]);
+  code.e(
+      "    $, $, task_desc->task_metadata.request_id,", logits.dim[1], parts);
+  code.e("    task_desc->task_metadata.merge_task_offset, runtime_config);");
   return register_task_variant(TASK_SERVING_SAMPLING, code.to_string());
 }
 

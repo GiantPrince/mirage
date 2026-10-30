@@ -59,14 +59,18 @@ constexpr int FINISH_NONE = 0;
 constexpr int FINISH_STOP = 1;
 constexpr int FINISH_LENGTH = 2;
 
-// Sampler implementation and scratch allocation constants.
-constexpr int MAX_SAMPLING_THREADS = 256;
-constexpr int WARP_SIZE = 32;
-constexpr int RADIX_BITS = 4;
-constexpr int RADIX_BINS = 16;
-constexpr int SCRATCH_WORKSPACE = 2 * RADIX_BINS * MAX_SAMPLING_THREADS / WARP_SIZE;
-constexpr int SCRATCH_STATE_WORDS = 2;
-constexpr int SAMPLING_SHARED_BYTES = 16 * 1024;
+// One sampler state row and one histogram/candidate slab per partition.
+constexpr int PARALLEL_SAMPLING_MAX_PARTS = 32;
+// exp((score - max) / temperature) is in [0, 1]: its high byte is 0..63.
+constexpr int PARALLEL_SAMPLING_MASS_BINS = 64;
+constexpr int PARALLEL_SAMPLING_STATE_WORDS = 256;
+// 128 coarse buckets each hold one count and one 64-bit significand.
+constexpr int PARALLEL_SAMPLING_PART_WORDS = 16 + 6 * PARALLEL_SAMPLING_MASS_BINS;
+// Preserve the history scratch stride used by the host extension. The old
+// workspace is unused by the multi-CTA sampler, but changing this stride
+// requires rebuilding both the extension and every compiled serving task.
+constexpr int HISTORY_CURSOR_OFFSET_WORDS = 256;
+constexpr int HISTORY_SCRATCH_RESERVED_WORDS = 258;
 
 #ifdef __CUDACC__
 __host__ __device__
@@ -86,10 +90,16 @@ constexpr int sampling_bitset_words(int vocab) {
 __host__ __device__
 #endif
 constexpr int sampling_scratch_words(int vocab) {
-  // Generated-token frequency plus two bitsets (all tokens and generated).
-  // Round the count array to an even word count for uint64 CTA reductions.
   return sampling_frequency_words(vocab) + 2 * sampling_bitset_words(vocab) +
-         SCRATCH_WORKSPACE + SCRATCH_STATE_WORDS;
+         HISTORY_SCRATCH_RESERVED_WORDS;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+constexpr int parallel_sampling_scratch_words(int vocab, int parts) {
+  return PARALLEL_SAMPLING_STATE_WORDS + 3 * ((vocab + 1) & ~1) +
+         parts * PARALLEL_SAMPLING_PART_WORDS;
 }
 
 inline void pack_config(ServingConfig *out, int64_t budget, int64_t seed,
