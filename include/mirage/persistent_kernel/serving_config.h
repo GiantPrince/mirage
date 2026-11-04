@@ -97,8 +97,28 @@ constexpr int sampling_scratch_words(int vocab) {
 #ifdef __CUDACC__
 __host__ __device__
 #endif
+constexpr bool parallel_sampling_compact_indices(int vocab, int parts) {
+  // A 16-bit offset must address every token within one partition.
+  return (vocab + parts - 1) / parts <= 65535;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+constexpr int parallel_sampling_index_words(int vocab, int parts) {
+  // Two 16-bit offsets fit in one word. Round to an even word count so the
+  // following per-partition state stays aligned for uint64_t/double fields.
+  return parallel_sampling_compact_indices(vocab, parts)
+             ? 2 * ((vocab + 3) / 4)
+             : ((vocab + 1) & ~1);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
 constexpr int parallel_sampling_scratch_words(int vocab, int parts) {
-  return PARALLEL_SAMPLING_STATE_WORDS + 3 * ((vocab + 1) & ~1) +
+  return PARALLEL_SAMPLING_STATE_WORDS +
+         parallel_sampling_index_words(vocab, parts) +
          parts * PARALLEL_SAMPLING_PART_WORDS;
 }
 
