@@ -4,8 +4,10 @@
 // Copyright contributors to the vLLM project (uniform/Gumbel transform).
 #pragma once
 #include "mirage/persistent_kernel/serving_config.h"
+#include "mirage/persistent_kernel/tasks/common/bfloat16.h"
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
+#include <cub/warp/warp_merge_sort.cuh>
 #include <cuda/atomic>
 #include <cuda/std/functional>
 #include <cuda_runtime.h>
@@ -65,6 +67,23 @@ struct ChooseDraw {
       return exact > 0 ? a : b;
     }
     return a.token < b.token ? a : b;
+  }
+};
+
+// The first two perturbed-score winners share one RNG pass. Both may be
+// checked against the nucleus in the following parallel reduction.
+struct TwoDraws {
+  Draw first, second;
+};
+struct ChooseTwoDraws {
+  float temperature;
+  __device__ TwoDraws operator()(TwoDraws a, TwoDraws b) const {
+    ChooseDraw choose{temperature};
+    Draw winner = choose(a.first, b.first);
+    if (winner.token == a.first.token && winner.score == a.first.score) {
+      return {winner, choose(a.second, b.first)};
+    }
+    return {winner, choose(b.second, a.first)};
   }
 };
 
@@ -300,97 +319,44 @@ __device__ inline void scan_logits(T const *logits, int vocab, Visit visit) {
   }
 }
 
-struct MaximumIndex {
-  __device__ int operator()(int a, int b) const {
-    return max(a, b);
-  }
-};
-
-// One request runs through these task phases. Partitioned phases use one CTA
-// per vocabulary partition and share a request-local scratch row.
 enum ServingSamplingPhase {
   SAMPLE_PREPARE = 0,
   SAMPLE_SCORES = 1,
-  SAMPLE_COARSE_FILTER = 2,
-  SAMPLE_RADIX_0 = 3,
-  SAMPLE_RADIX_1 = 4,
-  SAMPLE_RADIX_2 = 5,
-  SAMPLE_RADIX_3 = 6,
-  SAMPLE_MASKED_FILTER = 7,
-  SAMPLE_COLLECT = 8,
+  SAMPLE_SELECT = 2,
+  SAMPLE_RADIX_1 = 3,
+  SAMPLE_RADIX_2 = 4,
+  SAMPLE_RADIX_3 = 5,
+  SAMPLE_DRAW = 6,
+  SAMPLE_CHECK = 7,
+  SAMPLE_RETRY = 8,
   SAMPLE_FINISH = 9,
 };
-
-enum ParallelSamplingRoute {
-  PARALLEL_SAMPLE_REJECTION,
-  PARALLEL_SAMPLE_RADIX,
-};
-
+// Counters join vocabulary partitions without blocking persistent workers.
+// Radix counters are reused by mass checks after the cutoff is resolved.
 struct ParallelSamplingState {
-  // CTA completion counters for the coarse, score, and candidate phases.
-  int arrivals[3];
-  int radix_arrivals[4];
-  // Request identity and output location.
-  int active;
-  int done;
-  int row;
-  int logit_row;
-  int position;
-  int vocab;
-  int parts;
-  // Top-k selection state; k becomes zero after the radix cutoff is known.
-  int k;
-  int best_token;
-  int token;
-  int selected_part;
-  int remaining_k;
-  int boundary_bucket;
-  int radix_rank;
-  int radix_done;
-  uint32_t radix_prefix;
-  uint32_t radix_mask;
-  // Rejection sampler state shared by the finishing CTA.
-  int draw_count;
-  bool sample_boundary;
-  bool rejected;
-  ParallelSamplingRoute route;
-  float maximum;
-  float temperature;
-  float candidate_weight;
-  float candidate_score;
-  float lower_weight;
-  float lower_score;
-  double p;
-  double target;
-  double residual;
-  double tile_mass;
-  double accepted[PARALLEL_SAMPLING_MAX_PARTS];
-  double boundary_mass[PARALLEL_SAMPLING_MAX_PARTS];
+  int arrivals[3], radix_arrivals[4];
+  int active, done, row, logit_row, position, vocab, parts;
+  int k, best_token, token, radix_rank;
+  uint32_t radix_prefix, radix_mask;
+  bool radix_done, compact_top_k, pivot_top_p, needs_check, refine_top_k;
+  int prefilter_bucket;
+  float maximum, temperature, candidate_weight, candidate_score;
+  float alternate_weight;
+  int alternate_token;
+  double p, target;
 };
-
 struct ParallelSamplingPart {
-  uint64_t best;
-  Draw draw;
-  uint64_t significands;
-  int count, candidate_count;
-  // The coarse histogram is no longer needed when radix selection starts.
-  // Phase 7 rebuilds it after the final radix pass has completed.
-  union {
-    struct {
-      uint32_t counts[2 * PARALLEL_SAMPLING_MASS_BINS];
-      unsigned long long mantissas[2 * PARALLEL_SAMPLING_MASS_BINS];
-    } histogram;
-    uint32_t radix_counts[256];
-  };
+  uint64_t best, second;
+  Draw draw, second_draw;
+  double above_mass, total_mass, alternate_mass;
+  int candidate_count;
+  uint32_t radix_counts[256];
 };
-
 static_assert(sizeof(ParallelSamplingState) <=
               PARALLEL_SAMPLING_STATE_WORDS * sizeof(float));
 static_assert(sizeof(ParallelSamplingPart) <=
               PARALLEL_SAMPLING_PART_WORDS * sizeof(float));
 constexpr int PARALLEL_CUB_OFFSET = 12 * 1024;
-constexpr int PARALLEL_SAMPLE_WIDTH = 16;
-
 struct ParallelSamplingScratch {
   ParallelSamplingState &state;
   // Layout: request state, candidate IDs, then one state slab per partition.
@@ -430,13 +396,14 @@ struct ParallelSamplingScratch {
   }
 };
 
-// Reuse the idle history count row for weights when frequency penalty is off.
-// Otherwise keep the counts and recompute weights from the input logits.
-template <typename T> struct ParallelSamplingReader {
+// Reuse the idle frequency-count row for Gumbel noise. Frequency penalties
+// keep their count row and regenerate noise from the same per-token RNG.
+template <typename T>
+struct ParallelSamplingReader {
   T const *logits;
   SamplingScoreReader score_reader;
   ParallelSamplingState const &state;
-  float *cached_weights;
+  float *cached_noise;
   bool plain_logits;
 
   __device__ static SamplingScoreReader make_score_reader(
@@ -460,9 +427,10 @@ template <typename T> struct ParallelSamplingReader {
       : logits(logits),
         score_reader(make_score_reader(history_buffer, padded_vocab, cfg)),
         state(state),
-        cached_weights(cfg->frequency_penalty == 0 ? history_buffer : nullptr),
+        cached_noise(cfg->frequency_penalty == 0 ? history_buffer : nullptr),
         plain_logits(cfg->bias_count == 0 && cfg->repetition_penalty == 1 &&
-                     cfg->frequency_penalty == 0 && cfg->presence_penalty == 0) {}
+                     cfg->frequency_penalty == 0 &&
+                     cfg->presence_penalty == 0) {}
 
   __device__ float processed_score(int token, float value) const {
     return plain_logits ? (isnan(value) ? -INFINITY : value)
@@ -475,15 +443,11 @@ template <typename T> struct ParallelSamplingReader {
     return (processed_score(token) - state.maximum) / state.temperature;
   }
   __device__ float weight(int token) const {
-    if (cached_weights) {
-      return cached_weights[token];
-    }
-    float score = scaled_score(token);
-    // After radix top-k, exclude scores below the selected cutoff.
+    float score = processed_score(token);
     if (state.radix_done && score_bits(score) < state.radix_prefix) {
       return 0.f;
     }
-    return expf(score);
+    return expf((score - state.maximum) / state.temperature);
   }
 };
 
@@ -500,171 +464,6 @@ __device__ inline bool parallel_last_arrival(ParallelSamplingState &state,
   return __syncthreads_or(last);
 }
 
-__device__ inline double parallel_bucket_mass(ParallelSamplingPart const &part,
-                                              int bucket) {
-  double mass = 0;
-  for (int sub = 0; sub < 2; ++sub) {
-    int index = 2 * bucket + sub;
-    uint32_t exponent = 2 * bucket + sub;
-    double sig = double(part.histogram.mantissas[index]);
-    if (exponent) {
-      sig += double(part.histogram.counts[index]) * 8388608.0;
-    }
-    double unit =
-        exponent ? double(__uint_as_float(exponent << 23)) * 0x1p-23 : 0x1p-149;
-    mass += sig * unit;
-  }
-  return mass;
-}
-
-// All weights in the boundary bucket have one of two adjacent exponents.
-// Accumulate their aligned significands as integers for reproducible sums.
-__device__ inline uint64_t parallel_boundary_significand(float weight,
-                                                         int bucket) {
-  uint32_t bits = __float_as_uint(weight);
-  uint32_t exponent = (bits >> 23) & 255;
-  uint64_t sig = (bits & 0x7fffffu) + (exponent ? 0x800000u : 0u);
-  return bucket ? sig << (exponent & 1) : sig;
-}
-
-__device__ inline double parallel_boundary_mass(uint64_t sig, int bucket) {
-  uint32_t exponent = 2 * bucket;
-  double unit =
-      exponent ? double(__uint_as_float(exponent << 23)) * 0x1p-23 : 0x1p-149;
-  return double(sig) * unit;
-}
-
-template <typename T>
-__device__ inline bool
-    parallel_above_candidate(ParallelSamplingScratch const &scratch,
-                             ParallelSamplingReader<T> const &reader,
-                             int token) {
-  auto const &s = scratch.state;
-  // Top-k compares scores; top-p compares their probability weights.
-  return s.k ? reader.scaled_score(token) > s.candidate_score
-             : reader.weight(token) > s.candidate_weight;
-}
-
-template <typename T>
-__device__ inline bool
-    parallel_eligible_boundary(ParallelSamplingScratch const &scratch,
-                               ParallelSamplingReader<T> const &reader,
-                               int token) {
-  auto const &s = scratch.state;
-  if (!s.rejected) {
-    return true;
-  }
-  return s.k ? reader.scaled_score(token) > s.lower_score
-             : reader.weight(token) > s.lower_weight;
-}
-
-__device__ inline void parallel_choose_part(ParallelSamplingState &s,
-                                            ServingConfig const *cfg) {
-  double higher_mass = 0, boundary_mass = 0;
-  for (int j = 0; j < s.parts; ++j) {
-    higher_mass += s.accepted[j];
-    boundary_mass += s.boundary_mass[j];
-  }
-  SamplingRng rng{uint64_t(cfg->seed), uint32_t(s.position)};
-  double target = (double(rng.bits(s.draw_count++)) + 0.5) * 0x1p-32 *
-                  (higher_mass + boundary_mass);
-  s.sample_boundary = target >= higher_mass;
-  if (s.sample_boundary) {
-    target -= higher_mass;
-  }
-  double const *masses = s.sample_boundary ? s.boundary_mass : s.accepted;
-  int last = 0;
-  for (int j = 0; j < s.parts; ++j) {
-    if (masses[j] > 0) {
-      last = j;
-    }
-    if (target < masses[j]) {
-      s.selected_part = j;
-      s.residual = target;
-      return;
-    }
-    target -= masses[j];
-  }
-  s.selected_part = last;
-  s.residual = nextafter(masses[last], 0.0);
-}
-
-template <int Threads, typename T>
-__device__ inline void
-    parallel_draw_partition(ParallelSamplingScratch const &scratch,
-                            ParallelSamplingReader<T> const &reader,
-                            bool use_candidates) {
-  auto &s = scratch.state;
-  using Scan = cub::BlockScan<double, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
-  extern __shared__ __align__(16) unsigned char sampling_shared[];
-  auto &storage = *reinterpret_cast<typename Scan::TempStorage *>(
-      sampling_shared + PARALLEL_CUB_OFFSET);
-  int begin = s.vocab * s.selected_part / s.parts;
-  int end = s.vocab * (s.selected_part + 1) / s.parts;
-  int count = use_candidates && s.sample_boundary
-                  ? scratch.part(s.selected_part).candidate_count
-                  : end - begin;
-  double previous = 0;
-  int last = -1;
-  if (threadIdx.x == 0) {
-    s.token = INT_MAX;
-  }
-  __syncthreads();
-  for (int base = 0; base < count; base += Threads * PARALLEL_SAMPLE_WIDTH) {
-    double weights[PARALLEL_SAMPLE_WIDTH], cumulative[PARALLEL_SAMPLE_WIDTH];
-    for (int i = 0; i < PARALLEL_SAMPLE_WIDTH; ++i) {
-      int index = base + int(threadIdx.x) * PARALLEL_SAMPLE_WIDTH + i;
-      int token = index < count && use_candidates && s.sample_boundary
-                      ? scratch.candidate_token(begin, index)
-                      : begin + index;
-      float weight = index < count ? reader.weight(token) : 0;
-      int bucket = __float_as_uint(weight) >> 24;
-      bool eligible = s.sample_boundary
-                          ? bucket == s.boundary_bucket &&
-                                (index >= count ||
-                                 parallel_eligible_boundary(scratch, reader, token))
-                          : bucket > s.boundary_bucket;
-      weights[i] = index < count && eligible ? weight : 0;
-      if (weights[i] > 0) {
-        last = token;
-      }
-    }
-    Scan(storage).InclusiveSum(weights, cumulative);
-    if (threadIdx.x == Threads - 1) {
-      s.tile_mass = cumulative[PARALLEL_SAMPLE_WIDTH - 1];
-    }
-    __syncthreads();
-    for (int i = 0; i < PARALLEL_SAMPLE_WIDTH; ++i) {
-      if (weights[i] > 0 && previous + cumulative[i] > s.residual &&
-          previous + cumulative[i] - weights[i] <= s.residual) {
-        int index = base + int(threadIdx.x) * PARALLEL_SAMPLE_WIDTH + i;
-        int token = use_candidates && s.sample_boundary
-                        ? scratch.candidate_token(begin, index)
-                        : begin + index;
-        atomicMin(&s.token, token);
-      }
-    }
-    __syncthreads();
-    if (s.token != INT_MAX) {
-      break;
-    }
-    previous += s.tile_mass;
-    __syncthreads();
-  }
-  last = cub_block_reduce<Threads>(last, MaximumIndex{});
-  if (threadIdx.x == 0) {
-    if (s.token == INT_MAX) {
-      s.token = last >= 0 ? last : s.best_token;
-    }
-    s.candidate_weight = reader.weight(s.token);
-    s.candidate_score = reader.scaled_score(s.token);
-    if (!s.sample_boundary) {
-      s.done = true;
-    }
-  }
-  __syncthreads();
-}
-
 // Phase 0: initialize one request and its history-dependent penalties.
 __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
                                         float *history_buffer,
@@ -677,7 +476,8 @@ __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
                                         int logit_row,
                                         int padded_vocab,
                                         int parts,
-                                        bool active) {
+                                        bool active,
+                                        int batch_size = 1) {
   auto &s = scratch.state;
   if (threadIdx.x == 0) {
     s = ParallelSamplingState{};
@@ -690,9 +490,16 @@ __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
     if (active) {
       s.vocab = min(padded_vocab, int(cfg->vocab_size));
       s.k = cfg->top_k > 0 && cfg->top_k < s.vocab ? int(cfg->top_k) : 0;
-      s.remaining_k = s.k;
+      s.radix_rank = s.k;
       s.temperature = fmaxf(float(cfg->temperature), 0x1p-126f);
       s.p = cfg->top_p;
+      s.pivot_top_p =
+          !s.k && cfg->top_k != 1 && cfg->temperature > 0 && s.p < 1;
+      // Large pure top-p batches supply parallelism across rows; fewer
+      // partitions reduce the cost of their per-row reductions.
+      if (s.pivot_top_p && batch_size >= 24) {
+        s.parts = min(parts, 8);
+      }
     }
   }
   __syncthreads();
@@ -710,8 +517,20 @@ __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
   }
 }
 
-// Phase 1: process logits, find the row maximum, and handle greedy/unfiltered
-// draws.
+struct TopTwo {
+  uint64_t first, second;
+};
+struct ChooseTopTwo {
+  __device__ TopTwo operator()(TopTwo a, TopTwo b) const {
+    if (b.first > a.first) {
+      return {b.first, max(a.first, b.second)};
+    }
+    return {a.first, max(a.second, b.first)};
+  }
+};
+
+// Phase 1: process logits and find maxima, a safe top-k score bound, or the
+// first two Gumbel proposals. Greedy and unfiltered draws finish here.
 template <int Threads, typename T>
 __device__ __noinline__ void
     parallel_scores(T const *logits,
@@ -727,47 +546,137 @@ __device__ __noinline__ void
   ParallelSamplingReader reader(logits, history_scratch, padded_vocab, cfg, s);
   bool greedy = cfg->temperature == 0 || cfg->top_k == 1;
   bool unfiltered = !greedy && !s.k && s.p == 1;
+  bool pivot_top_p = !greedy && !s.k && s.p < 1;
+  bool draw_token = unfiltered || pivot_top_p;
   int begin = s.vocab * partition / s.parts,
       end = s.vocab * (partition + 1) / s.parts;
-  uint64_t best = 0;
+  uint64_t best = 0, second = 0;
+  bool compact_top_k = !greedy && s.k && s.k <= 2 * s.parts;
   Draw draw;
+  TwoDraws draws;
   ChooseDraw choose{s.temperature};
+  ChooseTwoDraws choose_two{s.temperature};
   SamplingRng rng{uint64_t(cfg->seed), uint32_t(s.position)};
   scan_logits<4>(logits + begin, end - begin, [&](int offset, float logit) {
     int v = begin + offset;
     float score = reader.processed_score(v, logit);
     uint64_t key = score_key(score, v);
+    if (compact_top_k && s.k > s.parts) {
+      second = key > best ? best : max(second, key);
+    }
     best = key > best ? key : best;
-    if (unfiltered) {
-      draw =
-          choose(draw, Draw{score, isfinite(score) ? rng.gumbel(v) : 0.f, v});
+    if (draw_token) {
+      float noise = isfinite(score) ? rng.gumbel(v) : 0.f;
+      if (pivot_top_p && reader.cached_noise) {
+        reader.cached_noise[v] = noise;
+      }
+      if (pivot_top_p) {
+        draws = choose_two(draws, TwoDraws{Draw{score, noise, v}, Draw{}});
+      } else {
+        draw = choose(draw, Draw{score, noise, v});
+      }
     }
   });
-  best = cub_block_reduce<Threads>(best, Maximum{});
-  if (unfiltered) {
+  if (compact_top_k && s.k > s.parts) {
+    auto top = cub_block_reduce<Threads>(TopTwo{best, second}, ChooseTopTwo{});
+    best = top.first;
+    second = top.second;
+  } else {
+    best = cub_block_reduce<Threads>(best, Maximum{});
+  }
+  if (pivot_top_p) {
+    draws = cub_block_reduce<Threads>(draws, choose_two);
+    draw = draws.first;
+  } else if (draw_token) {
     draw = cub_block_reduce<Threads>(draw, choose);
   }
   if (threadIdx.x == 0) {
     scratch.part(partition).best = best;
+    scratch.part(partition).second = second;
     scratch.part(partition).draw = draw;
+    if (pivot_top_p) {
+      scratch.part(partition).second_draw = draws.second;
+    }
   }
   if (!parallel_last_arrival(s, 1)) {
     return;
   }
+  int partial_count = s.k <= s.parts ? s.parts : 2 * s.parts;
+  // The kth score in this subset is a safe lower bound on the global
+  // kth score, even when the largest logits cluster in one partition.
+  if (compact_top_k && partial_count <= 32) {
+    if (threadIdx.x < 32) {
+      int lane = threadIdx.x;
+      uint64_t key = 0;
+      if (lane < partial_count) {
+        int part = s.k <= s.parts ? lane : lane / 2;
+        key = s.k <= s.parts || lane % 2 == 0 ? scratch.part(part).best
+                                              : scratch.part(part).second;
+      }
+      for (int group = 2; group <= 32; group *= 2) {
+        for (int gap = group / 2; gap; gap /= 2) {
+          uint64_t other = __shfl_xor_sync(0xffffffffu, key, gap);
+          bool larger = ((lane & gap) == 0) != ((lane & group) != 0);
+          key = larger ? max(key, other) : min(key, other);
+        }
+      }
+      if (lane == 0) {
+        s.best_token = 0xffffffffu - uint32_t(key);
+        s.maximum = reader.processed_score(s.best_token);
+        if (!isfinite(s.maximum)) {
+          s.token = s.best_token;
+          s.done = true;
+        }
+      }
+      if (lane == s.k - 1) {
+        s.candidate_score =
+            key ? reader.processed_score(0xffffffffu - uint32_t(key))
+                : -INFINITY;
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      s.compact_top_k = isfinite(s.candidate_score);
+    }
+    return;
+  }
   if (threadIdx.x == 0) {
     best = 0;
+    uint64_t pivot = UINT64_MAX;
     Draw winner;
+    if (pivot_top_p) {
+      draws = TwoDraws{};
+    }
     for (int j = 0; j < s.parts; ++j) {
       auto &part = scratch.part(j);
+      if (compact_top_k) {
+        pivot = min(pivot, s.k > s.parts ? part.second : part.best);
+      }
       if (part.best > best) {
         best = part.best;
       }
-      if (unfiltered) {
+      if (pivot_top_p) {
+        draws = choose_two(draws, TwoDraws{part.draw, part.second_draw});
+      } else if (draw_token) {
         winner = choose(winner, part.draw);
       }
     }
     s.best_token = 0xffffffffu - uint32_t(best);
     s.maximum = reader.processed_score(s.best_token);
+    if (compact_top_k) {
+      int token = 0xffffffffu - uint32_t(pivot);
+      s.candidate_score = pivot ? reader.processed_score(token) : -INFINITY;
+      s.compact_top_k = isfinite(s.candidate_score);
+    }
+    if (pivot_top_p) {
+      s.token = draws.first.token;
+      s.candidate_weight =
+          expf((draws.first.score - s.maximum) / s.temperature);
+      s.alternate_token = draws.second.token;
+      s.alternate_weight =
+          expf((draws.second.score - s.maximum) / s.temperature);
+      s.needs_check = true;
+    }
     if (greedy || !isfinite(s.maximum) || unfiltered) {
       s.token = unfiltered ? winner.token : s.best_token;
       s.done = true;
@@ -775,417 +684,703 @@ __device__ __noinline__ void
   }
 }
 
-// Phases 2 and 7: build a probability histogram. Phase 7 masks logits below
-// the top-k cutoff before applying top-p to that retained set.
-template <int Threads, typename T>
-__device__ inline void
-    parallel_coarse_filter(ParallelSamplingScratch const &scratch,
-                           ParallelSamplingReader<T> const &reader,
-                           ServingConfig const *cfg,
-                           int partition,
-                           bool masked = false) {
+template <int Threads>
+__device__ inline int const *
+    parallel_candidate_offsets(ParallelSamplingScratch const &scratch) {
   auto &s = scratch.state;
-  if (!s.active || s.done || (masked && s.route != PARALLEL_SAMPLE_RADIX)) {
-    return;
-  }
-  constexpr int Bins = PARALLEL_SAMPLING_MASS_BINS;
-  constexpr int Slots = 2 * Bins;
-  constexpr int Warps = Threads / 32;
   extern __shared__ __align__(16) unsigned char sampling_shared[];
-  auto *low = reinterpret_cast<uint32_t *>(sampling_shared);
-  auto *high = low + Slots * Warps;
-  auto *counts = high + Slots * Warps;
-  // Each warp accumulates its own histogram to reduce shared-memory contention.
-  static_assert(Slots * Warps * 12 <= PARALLEL_CUB_OFFSET);
-  for (int i = threadIdx.x; i < Slots * Warps; i += Threads) {
-    low[i] = high[i] = counts[i] = 0;
-  }
-  __syncthreads();
-  int begin = s.vocab * partition / s.parts,
-      end = s.vocab * (partition + 1) / s.parts;
-  int warp_offset = (threadIdx.x / 32) * Slots;
-  float maximum = s.maximum, temperature = s.temperature;
-  scan_logits<1>(reader.logits + begin, end - begin, [&](int offset, float logit) {
-    int token = begin + offset;
-    float score = reader.processed_score(token, logit);
-    float scaled_score = (score - maximum) / temperature;
-    float weight = expf(scaled_score);
-    if (masked && score_bits(scaled_score) < s.radix_prefix) {
-      weight = 0;
-    }
-    if (reader.cached_weights) {
-      reader.cached_weights[token] = weight;
-    }
-    uint32_t key = __float_as_uint(weight);
-    uint32_t slot = 2 * (key >> 24) + ((key >> 23) & 1);
-    uint32_t sig = key & 0x7fffffu;
-    // Shared 64-bit atomicAdd is a CAS loop on Ampere. Use native
-    // 32-bit additions and propagate the carry to keep the sum exact.
-    int index = warp_offset + slot;
-    uint32_t previous = atomicAdd(low + index, sig);
-    if (previous > UINT_MAX - sig) {
-      atomicAdd(high + index, 1u);
-    }
-    atomicAdd(counts + warp_offset + slot, 1u);
-  });
-  __syncthreads();
-  for (int i = threadIdx.x; i < Slots; i += Threads) {
-    uint32_t count = 0;
-    unsigned long long sum = 0;
-    for (int w = 0; w < Warps; ++w) {
-      count += counts[w * Slots + i];
-      int index = w * Slots + i;
-      sum += (uint64_t(high[index]) << 32) | low[index];
-    }
-    scratch.part(partition).histogram.counts[i] = count;
-    scratch.part(partition).histogram.mantissas[i] = sum;
-  }
-  if (!parallel_last_arrival(s, 0)) {
-    return;
-  }
-  // The last CTA combines partition histograms and finds the top-k or top-p
-  // boundary bucket. The other CTAs are finished with this phase.
-  int bucket = Bins - 1 - int(threadIdx.x);
-  int count = 0;
-  double mass = 0;
-  if (bucket >= 0) {
-    // Only these two histogram entries are consumed below. Keep aggregates
-    // in registers instead of constructing another shared histogram.
-    unsigned long long sums[2] = {0, 0};
-    uint32_t numbers[2] = {0, 0};
-    for (int j = 0; j < s.parts; ++j) {
-      for (int sub = 0; sub < 2; ++sub) {
-        sums[sub] += scratch.part(j).histogram.mantissas[2 * bucket + sub];
-        numbers[sub] += scratch.part(j).histogram.counts[2 * bucket + sub];
+  auto *offsets = reinterpret_cast<int *>(sampling_shared + 14 * 1024);
+  if (threadIdx.x < 32) {
+    int lane = threadIdx.x;
+    int count = lane < s.parts ? scratch.part(lane).candidate_count : 0;
+    for (int delta = 1; delta < 32; delta *= 2) {
+      int value = __shfl_up_sync(0xffffffffu, count, delta);
+      if (lane >= delta) {
+        count += value;
       }
     }
-    for (int sub = 0; sub < 2; ++sub) {
-      uint32_t exponent = 2 * bucket + sub;
-      double sig =
-          double(sums[sub]) + (exponent ? double(numbers[sub]) * 8388608.0 : 0);
-      double unit = exponent ? double(__uint_as_float(exponent << 23)) * 0x1p-23
-                             : 0x1p-149;
-      count += numbers[sub];
-      mass += sig * unit;
-    }
-  }
-  using CountScan = cub::BlockScan<int, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
-  using MassScan = cub::BlockScan<double, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
-  auto &count_storage = *reinterpret_cast<typename CountScan::TempStorage *>(
-      sampling_shared + PARALLEL_CUB_OFFSET);
-  auto &mass_storage = *reinterpret_cast<typename MassScan::TempStorage *>(
-      sampling_shared + PARALLEL_CUB_OFFSET);
-  int cumulative_count;
-  double cumulative_mass;
-  CountScan(count_storage).InclusiveSum(count, cumulative_count);
-  __syncthreads();
-  MassScan(mass_storage).InclusiveSum(mass, cumulative_mass);
-  if (threadIdx.x == Threads - 1) {
-    s.target = s.p * cumulative_mass;
-  }
-  __syncthreads();
-  bool selected =
-      s.k ? cumulative_count >= s.k && cumulative_count - count < s.k
-          : mass > 0 && cumulative_mass >= s.target &&
-                cumulative_mass - mass < s.target;
-  if (selected) {
-    s.boundary_bucket = bucket;
-    s.remaining_k = s.k ? s.k - (cumulative_count - count) : 0;
-    s.residual = cumulative_mass - mass;
-  }
-  __syncthreads();
-  // Split probability mass above and inside the boundary by partition. These
-  // totals let the finishing CTA choose a partition before scanning tokens.
-  int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-  for (int j = warp; j < s.parts; j += Warps) {
-    double higher = 0;
-    for (int b = s.boundary_bucket + 1 + lane; b < Bins; b += 32) {
-      higher += parallel_bucket_mass(scratch.part(j), b);
-    }
-    for (int delta = 16; delta; delta /= 2) {
-      higher += __shfl_down_sync(0xffffffffu, higher, delta);
+    if (lane < s.parts) {
+      offsets[lane + 1] = count;
     }
     if (lane == 0) {
-      s.accepted[j] = higher;
-      s.boundary_mass[j] =
-          parallel_bucket_mass(scratch.part(j), s.boundary_bucket);
+      offsets[0] = 0;
     }
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    s.target -= s.residual;
-    s.route =
-        s.k && s.p < 1 ? PARALLEL_SAMPLE_RADIX : PARALLEL_SAMPLE_REJECTION;
-    if (s.route == PARALLEL_SAMPLE_RADIX) {
-      s.radix_rank = s.remaining_k;
-      s.radix_done = 0;
-      s.radix_prefix = 0;
-      s.radix_mask = 0;
-      s.arrivals[0] = 0;
-    }
-    if (s.route == PARALLEL_SAMPLE_REJECTION) {
-      parallel_choose_part(s, cfg);
+  return offsets;
+}
+
+// The vocabulary scan is distributed; only this bounded candidate set
+// needs a final warp-local sort and categorical draw.
+template <typename T>
+__device__ inline void
+    parallel_sort_warp(ParallelSamplingScratch const &scratch,
+                       ParallelSamplingReader<T> const &reader,
+                       ServingConfig const *cfg,
+                       int const *offsets) {
+  auto &s = scratch.state;
+  int lane = threadIdx.x;
+  int token_bits = 32 - __clz(uint32_t(s.vocab - 1));
+  uint32_t token_mask = (uint32_t(1) << token_bits) - 1;
+  uint32_t minimum = score_bits(nextafterf(s.candidate_score, -INFINITY));
+  uint64_t keys[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    int index = lane * 2 + i;
+    keys[i] = uint64_t(minimum) << token_bits;
+    if (index < offsets[s.parts]) {
+      int lo = 0, hi = s.parts;
+      while (lo + 1 < hi) {
+        int mid = (lo + hi) / 2;
+        if (offsets[mid] <= index) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      int begin = s.vocab * lo / s.parts;
+      int token = scratch.candidate_token(begin, index - offsets[lo]);
+      keys[i] =
+          (uint64_t(score_bits(reader.processed_score(token))) << token_bits) |
+          (token_mask - uint32_t(token));
     }
   }
-  __syncthreads();
-  // H is wholly inside the retained set; only the boundary bucket B is
-  // unresolved. Sampling H+B and rejecting only proven outsiders preserves
-  // the target distribution without completing every radix digit.
-  if (s.route == PARALLEL_SAMPLE_REJECTION) {
-    parallel_draw_partition<Threads>(scratch, reader, false);
+  extern __shared__ __align__(16) unsigned char sampling_shared[];
+  using Sort = cub::WarpMergeSort<uint64_t, 2>;
+  auto &storage =
+      *reinterpret_cast<typename Sort::TempStorage *>(sampling_shared);
+  Sort(storage).Sort(keys, cuda::std::greater<uint64_t>{});
+  int selected = s.k - 1;
+  uint32_t cutoff = __shfl_sync(
+      0xffffffffu, uint32_t(keys[selected % 2] >> token_bits), selected / 2);
+  double weights[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    int token = token_mask - uint32_t(keys[i] & token_mask);
+    weights[i] = lane * 2 + i < offsets[s.parts] &&
+                         uint32_t(keys[i] >> token_bits) >= cutoff
+                     ? reader.weight(token)
+                     : 0;
+  }
+  double local = weights[0] + weights[1], prefix = local;
+  for (int delta = 1; delta < 32; delta *= 2) {
+    double value = __shfl_up_sync(0xffffffffu, prefix, delta);
+    if (lane >= delta) {
+      prefix += value;
+    }
+  }
+  double cdf[2] = {prefix - local + weights[0], prefix};
+  double total = __shfl_sync(0xffffffffu, prefix, 31);
+  if (s.p < 1) {
+    double target = s.p * total;
+    uint32_t boundary = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      if (weights[i] > 0 && cdf[i] >= target && cdf[i] - weights[i] < target) {
+        boundary = max(boundary, __float_as_uint(float(weights[i])));
+      }
+    }
+    boundary = __reduce_max_sync(0xffffffffu, boundary);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      if (__float_as_uint(float(weights[i])) < boundary) {
+        weights[i] = 0;
+      }
+    }
+    local = weights[0] + weights[1];
+    prefix = local;
+    for (int delta = 1; delta < 32; delta *= 2) {
+      double value = __shfl_up_sync(0xffffffffu, prefix, delta);
+      if (lane >= delta) {
+        prefix += value;
+      }
+    }
+    cdf[0] = prefix - local + weights[0];
+    cdf[1] = prefix;
+    total = __shfl_sync(0xffffffffu, prefix, 31);
+  }
+  double uniform = 0;
+  if (lane == 0) {
+    SamplingRng rng{uint64_t(cfg->seed), uint32_t(s.position)};
+    uniform = (double(rng.bits(0)) + .5) * 0x1p-32;
+  }
+  double target = __shfl_sync(0xffffffffu, uniform, 0) * total;
+  int token = INT_MAX;
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    if (weights[i] > 0 && cdf[i] > target && cdf[i] - weights[i] <= target) {
+      token = min(token, int(token_mask - uint32_t(keys[i] & token_mask)));
+    }
+  }
+  token = __reduce_min_sync(0xffffffffu, token);
+  if (lane == 0) {
+    s.token = token == INT_MAX ? s.best_token : token;
+    s.done = true;
   }
 }
 
-// Phases 3-6: resolve the top-k boundary by one score byte per phase.
-// Only requests combining top-k and top-p enter this path.
-template <int Threads, int Round, typename T>
+template <int Threads, typename T>
 __device__ inline void
-    parallel_radix_top_k(ParallelSamplingScratch const &scratch,
-                         ParallelSamplingReader<T> const &reader,
-                         int partition) {
-  auto &s = scratch.state;
-  if (!s.active || s.done || s.radix_done || s.route != PARALLEL_SAMPLE_RADIX) {
-    return;
+    parallel_sample_candidates(ParallelSamplingScratch const &scratch,
+                               ParallelSamplingReader<T> const &reader,
+                               ServingConfig const *cfg,
+                               int const *offsets) {
+  if (threadIdx.x < 32) {
+    parallel_sort_warp(scratch, reader, cfg, offsets);
   }
-  constexpr int Bins = 256;
-  constexpr int Warps = Threads / 32;
-  constexpr int Shift = 24 - 8 * Round;
+  __syncthreads();
+}
+
+template <int Threads, typename T>
+__device__ inline void
+    parallel_compact_top_k(ParallelSamplingScratch const &scratch,
+                           ParallelSamplingReader<T> const &reader,
+                           ServingConfig const *cfg,
+                           int partition) {
+  auto &s = scratch.state;
+  auto &part = scratch.part(partition);
+  constexpr int Bins = 32, Warps = Threads / 32;
+  static_assert(Bins * PARALLEL_SAMPLING_MAX_PARTS * sizeof(uint32_t) <=
+                PARALLEL_CUB_OFFSET);
   extern __shared__ __align__(16) unsigned char sampling_shared[];
-  auto *histogram = reinterpret_cast<unsigned int *>(sampling_shared);
+  auto *histogram = reinterpret_cast<uint32_t *>(sampling_shared);
   for (int i = threadIdx.x; i < Bins * Warps; i += Threads) {
     histogram[i] = 0;
   }
-  __syncthreads();
-  int begin = s.vocab * partition / s.parts;
-  int end = s.vocab * (partition + 1) / s.parts;
-  uint32_t prefix = s.radix_prefix, mask = s.radix_mask;
-  int warp_offset = threadIdx.x / 32 * Bins;
-  auto &part = scratch.part(partition);
-  if constexpr (Round == 0) {
-    if (threadIdx.x == 0) {
-      part.candidate_count = 0;
-    }
-  }
-  __syncthreads();
-  int count = Round == 0 ? end - begin : part.candidate_count;
-  // The first pass visits the whole partition and compacts the coarse
-  // boundary bucket. Later passes only revisit those candidate token IDs.
-  for (int index = threadIdx.x; index < count; index += Threads) {
-    int token = Round == 0 ? begin + index
-                           : scratch.candidate_token(begin, index);
-    if constexpr (Round == 0) {
-      int bucket = __float_as_uint(reader.weight(token)) >> 24;
-      if (bucket != s.boundary_bucket) {
-        continue;
-      }
-      int offset = atomicAdd(&part.candidate_count, 1);
-      scratch.store_candidate(begin, offset, token);
-    }
-    float normalized = reader.scaled_score(token);
-    uint32_t bits = score_bits(normalized);
-    if ((bits & mask) == prefix) {
-      atomicAdd(histogram + warp_offset + ((bits >> Shift) & 255), 1u);
-    }
-  }
-  __syncthreads();
-  auto *counts = part.radix_counts;
-  for (int i = threadIdx.x; i < Bins; i += Threads) {
-    int count = 0;
-    for (int warp = 0; warp < Warps; ++warp) {
-      count += histogram[warp * Bins + i];
-    }
-    counts[i] = count;
-  }
-  __syncthreads();
-  bool last = false;
   if (threadIdx.x == 0) {
-    cuda::atomic_ref<int, cuda::thread_scope_device> arrivals(
-        s.radix_arrivals[Round]);
-    last = arrivals.fetch_add(1, cuda::memory_order_acq_rel) == s.parts - 1;
+    part.candidate_count = 0;
   }
-  if (!__syncthreads_or(last)) {
-    return;
-  }
-  // One CTA merges all radix histograms and descends into the bin containing
-  // the remaining top-k rank. Extra threads contribute zero when Threads=256.
-  using Scan = cub::BlockScan<int, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
-  auto &storage = *reinterpret_cast<typename Scan::TempStorage *>(
-      sampling_shared + PARALLEL_CUB_OFFSET);
-  static_assert(PARALLEL_CUB_OFFSET + sizeof(typename Scan::TempStorage) <=
-                PARALLEL_SAMPLING_SHARED_BYTES);
-  int bin_counts[2], cumulative[2];
-  for (int i = 0; i < 2; ++i) {
-    int bin = Bins - 1 - int(threadIdx.x) * 2 - i;
-    int count = 0;
-    if (bin >= 0) {
-      for (int part = 0; part < s.parts; ++part) {
-        count += scratch.part(part).radix_counts[bin];
-      }
-    }
-    bin_counts[i] = count;
-  }
-  Scan(storage).InclusiveSum(bin_counts, cumulative);
-  int rank = s.radix_rank;
-  for (int i = 0; i < 2; ++i) {
-    int bin = Bins - 1 - int(threadIdx.x) * 2 - i;
-    if (bin >= 0 && cumulative[i] >= rank &&
-        cumulative[i] - bin_counts[i] < rank) {
-      s.radix_prefix |= uint32_t(bin) << Shift;
-      s.radix_mask |= 255u << Shift;
-      int remaining = rank - (cumulative[i] - bin_counts[i]);
-      s.radix_rank = remaining;
-      if (remaining == bin_counts[i] || Round == 3) {
-        // The whole selected bucket is retained, including boundary ties.
-        s.radix_done = 1;
-        s.k = 0;
-      }
-    }
-  }
-}
-
-// Shared acceptance test for the first boundary draw and later refinements.
-__device__ inline void
-    parallel_test_candidate(ParallelSamplingScratch const &scratch) {
-  auto &s = scratch.state;
-  uint64_t sig = 0;
-  int count = 0;
-  for (int j = 0; j < s.parts; ++j) {
-    sig += scratch.part(j).significands;
-    count += scratch.part(j).count;
-  }
-  bool accepted =
-      s.k ? count < s.remaining_k
-          : parallel_boundary_mass(sig, s.boundary_bucket) < s.target;
-  if (accepted) {
-    s.done = true;
-  } else {
-    s.rejected = true;
-    s.lower_weight = s.candidate_weight;
-    s.lower_score = s.candidate_score;
-    for (int j = 0; j < s.parts; ++j) {
-      s.boundary_mass[j] = parallel_boundary_mass(scratch.part(j).significands,
-                                                  s.boundary_bucket);
-    }
-  }
-}
-
-// Phase 8: collect the unresolved boundary bucket in token order.
-template <int Threads, typename T>
-__device__ __noinline__ void
-    parallel_collect(ParallelSamplingScratch const &scratch,
-                     ParallelSamplingReader<T> const &reader,
-                     int partition) {
-  auto &s = scratch.state;
-  if (!s.active || s.done || s.route == PARALLEL_SAMPLE_RADIX) {
-    return;
-  }
-  auto &part = scratch.part(partition);
-  using Scan = cub::BlockScan<int, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
-  extern __shared__ __align__(16) unsigned char sampling_shared[];
-  auto &storage = *reinterpret_cast<typename Scan::TempStorage *>(
-      sampling_shared + PARALLEL_CUB_OFFSET);
+  __syncthreads();
   int begin = s.vocab * partition / s.parts,
       end = s.vocab * (partition + 1) / s.parts;
-  uint64_t sig = 0;
-  int offset = 0;
-  // Stable compaction makes CDF traversal independent of warp arrival order.
-  for (int base = begin; base < end; base += Threads * 4) {
-    unsigned selected = 0;
-    for (int i = 0; i < 4; ++i) {
-      int token = base + int(threadIdx.x) * 4 + i;
-      float weight = token < end ? reader.weight(token) : 0;
-      int bucket = __float_as_uint(weight) >> 24;
-      bool eligible = weight > 0 && bucket == s.boundary_bucket &&
-                      token < end && parallel_above_candidate(scratch, reader, token);
-      if (token < end && eligible) {
-        selected |= 1u << i;
+  int lane = threadIdx.x % 32, warp_offset = threadIdx.x / 32 * Bins;
+  float pivot = s.candidate_score;
+  uint32_t lower = score_bits(pivot);
+  int shift = max(0, 27 - __clz(score_bits(s.maximum) - lower));
+  for (int token = begin + threadIdx.x; token < end; token += Threads) {
+    float score = reader.processed_score(token);
+    bool keep = score >= pivot;
+    unsigned active = __activemask();
+    unsigned selected = __ballot_sync(active, keep);
+    if (selected) {
+      int offset = 0;
+      if (lane == 0) {
+        offset = atomicAdd(&part.candidate_count, __popc(selected));
+      }
+      offset = __shfl_sync(active, offset, 0);
+      if (keep) {
+        scratch.store_candidate(
+            begin,
+            offset + __popc(selected & ((uint32_t(1) << lane) - 1)),
+            token);
+        atomicAdd(histogram + warp_offset +
+                      int((score_bits(score) - lower) >> shift),
+                  1u);
       }
     }
+  }
+  __syncthreads();
+  for (int bin = threadIdx.x; bin < Bins; bin += Threads) {
+    uint32_t count = 0;
+    for (int warp = 0; warp < Warps; ++warp) {
+      count += histogram[warp * Bins + bin];
+    }
+    part.radix_counts[bin] = count;
+  }
+  if (!parallel_last_arrival(s, 2)) {
+    return;
+  }
+  int const *offsets = parallel_candidate_offsets<Threads>(scratch);
+  if (offsets[s.parts] <= 64) {
+    parallel_sample_candidates<Threads>(scratch, reader, cfg, offsets);
+    return;
+  }
+  // Cache the small relative-score histograms before combining them.
+  // This narrows skewed candidate lists without rereading the vocabulary.
+  auto *cached = reinterpret_cast<uint32_t *>(sampling_shared);
+  for (int index = threadIdx.x; index < s.parts * Bins; index += Threads) {
+    cached[index] = scratch.part(index / Bins).radix_counts[index % Bins];
+  }
+  __syncthreads();
+  int bin = Bins - 1 - int(threadIdx.x), count = 0;
+  if (bin >= 0) {
+    for (int j = 0; j < s.parts; ++j) {
+      count += cached[j * Bins + bin];
+    }
+  }
+  using Scan = cub::BlockScan<int, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
+  auto &storage = *reinterpret_cast<typename Scan::TempStorage *>(
+      sampling_shared + PARALLEL_CUB_OFFSET);
+  int cumulative;
+  Scan(storage).InclusiveSum(count, cumulative);
+  if (bin >= 0 && cumulative >= s.k && cumulative - count < s.k) {
+    s.prefilter_bucket = bin;
+    s.refine_top_k = cumulative <= 64;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    s.radix_rank = s.k;
+    s.radix_done = false;
+    s.radix_prefix = 0;
+    s.radix_mask = 0;
+    // Reuse the join counter only if the next phase compacts again.
+    if (s.refine_top_k) {
+      s.arrivals[2] = 0;
+    }
+  }
+}
+
+template <int Threads, typename T>
+__device__ inline void
+    parallel_refine_top_k(ParallelSamplingScratch const &scratch,
+                          ParallelSamplingReader<T> const &reader,
+                          ServingConfig const *cfg,
+                          int partition) {
+  auto &s = scratch.state;
+  auto &part = scratch.part(partition);
+  int begin = s.vocab * partition / s.parts, count = part.candidate_count,
+      offset = 0;
+  uint32_t lower = score_bits(s.candidate_score);
+  int shift = max(0, 27 - __clz(score_bits(s.maximum) - lower));
+  int boundary = s.prefilter_bucket;
+  extern __shared__ __align__(16) unsigned char sampling_shared[];
+  using Scan = cub::BlockScan<int, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
+  auto &storage =
+      *reinterpret_cast<typename Scan::TempStorage *>(sampling_shared);
+  for (int base = 0; base < count; base += Threads * 4) {
+    int tokens[4];
+    unsigned selected = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int index = base + int(threadIdx.x) * 4 + i;
+      if (index < count) {
+        tokens[i] = scratch.candidate_token(begin, index);
+        if (int((score_bits(reader.processed_score(tokens[i])) - lower) >>
+                shift) >= boundary) {
+          selected |= 1u << i;
+        }
+      }
+    }
+    // Read the whole tile before compacting into the same index array.
+    __syncthreads();
     int prefix, total;
     Scan(storage).ExclusiveSum(__popc(selected), prefix, total);
+#pragma unroll
     for (int i = 0; i < 4; ++i) {
       if (selected & (1u << i)) {
-        int token = base + int(threadIdx.x) * 4 + i;
-        int index = offset + prefix++;
-        scratch.store_candidate(begin, index, token);
-        sig += parallel_boundary_significand(reader.weight(token),
-                                             s.boundary_bucket);
+        scratch.store_candidate(begin, offset + prefix++, tokens[i]);
       }
     }
     offset += total;
     __syncthreads();
   }
-  sig = cub_block_reduce<Threads>(sig, cuda::std::plus<uint64_t>{});
   if (threadIdx.x == 0) {
     part.candidate_count = offset;
-    part.significands = sig;
-    part.count = offset;
   }
-  if (parallel_last_arrival(s, 2) && threadIdx.x == 0) {
-    parallel_test_candidate(scratch);
+  if (!parallel_last_arrival(s, 2)) {
+    return;
   }
+  int const *offsets = parallel_candidate_offsets<Threads>(scratch);
+  parallel_sample_candidates<Threads>(scratch, reader, cfg, offsets);
 }
 
-template <int Threads, typename T>
-__device__ inline void parallel_refine(ParallelSamplingScratch const &scratch,
-                                      ParallelSamplingReader<T> const &reader) {
+// A radix pass counts one score byte across the vocabulary partitions. The
+// second pass compacts the first selected byte for subsequent refinement.
+template <int Threads, int Round, typename T>
+__device__ inline void parallel_radix(ParallelSamplingScratch const &scratch,
+                                      ParallelSamplingReader<T> const &reader,
+                                      int partition) {
   auto &s = scratch.state;
-  int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
-  for (int j = warp; j < s.parts; j += Threads / 32) {
-    auto &part = scratch.part(j);
-    int begin = s.vocab * j / s.parts;
-    uint64_t sig = 0;
-    int count = 0;
-    for (int i = lane; i < part.candidate_count; i += 32) {
-      int token = scratch.candidate_token(begin, i);
-      if (parallel_above_candidate(scratch, reader, token)) {
-        sig += parallel_boundary_significand(reader.weight(token),
-                                             s.boundary_bucket);
-        ++count;
+  if (s.radix_done) {
+    return;
+  }
+  constexpr int Bins = 256, Warps = Threads / 32, Shift = 24 - 8 * Round;
+  extern __shared__ __align__(16) unsigned char sampling_shared[];
+  auto *histogram = reinterpret_cast<uint32_t *>(sampling_shared);
+  for (int i = threadIdx.x; i < Bins * Warps; i += Threads) {
+    histogram[i] = 0;
+  }
+  auto &part = scratch.part(partition);
+  if constexpr (Round == 1) {
+    if (threadIdx.x == 0 && !s.compact_top_k) {
+      part.candidate_count = 0;
+    }
+  }
+  __syncthreads();
+  int begin = s.vocab * partition / s.parts,
+      end = s.vocab * (partition + 1) / s.parts;
+  int count =
+      (Round <= 1 && !s.compact_top_k) ? end - begin : part.candidate_count;
+  uint32_t prefix = s.radix_prefix, mask = s.radix_mask;
+  int lane = threadIdx.x % 32, warp_offset = threadIdx.x / 32 * Bins;
+  for (int i = threadIdx.x; i < count; i += Threads) {
+    int token = (Round <= 1 && !s.compact_top_k)
+                    ? begin + i
+                    : scratch.candidate_token(begin, i);
+    uint32_t bits = score_bits(reader.processed_score(token));
+    bool keep = (bits & mask) == prefix;
+    if constexpr (Round == 1) {
+      if (!s.compact_top_k) {
+        unsigned active = __activemask();
+        unsigned selected = __ballot_sync(active, keep);
+        int base = 0;
+        if (lane == 0 && selected) {
+          base = atomicAdd(&part.candidate_count, __popc(selected));
+        }
+        base = __shfl_sync(active, base, 0);
+        if (keep) {
+          scratch.store_candidate(
+              begin,
+              base + __popc(selected & ((uint32_t(1) << lane) - 1)),
+              token);
+        }
       }
     }
-    for (int delta = 16; delta; delta /= 2) {
-      sig += __shfl_down_sync(0xffffffffu, sig, delta);
-      count += __shfl_down_sync(0xffffffffu, count, delta);
-    }
-    if (lane == 0) {
-      part.significands = sig;
-      part.count = count;
+    if (keep) {
+      atomicAdd(histogram + warp_offset + ((bits >> Shift) & 255), 1u);
     }
   }
   __syncthreads();
+  for (int bin = threadIdx.x; bin < Bins; bin += Threads) {
+    uint32_t count = 0;
+    for (int warp = 0; warp < Warps; ++warp) {
+      count += histogram[warp * Bins + bin];
+    }
+    part.radix_counts[bin] = count;
+  }
+  __syncthreads();
+  bool last = false;
   if (threadIdx.x == 0) {
-    parallel_test_candidate(scratch);
+    cuda::atomic_ref<int, cuda::thread_scope_device> counter(
+        s.radix_arrivals[Round]);
+    last = counter.fetch_add(1, cuda::memory_order_acq_rel) == s.parts - 1;
+  }
+  if (!__syncthreads_or(last)) {
+    return;
+  }
+  using Scan = cub::BlockScan<int, Threads, cub::BLOCK_SCAN_WARP_SCANS>;
+  auto &storage = *reinterpret_cast<typename Scan::TempStorage *>(
+      sampling_shared + PARALLEL_CUB_OFFSET);
+  int counts[2], cdf[2];
+  for (int i = 0; i < 2; ++i) {
+    int bin = 255 - int(threadIdx.x) * 2 - i;
+    counts[i] = 0;
+    if (bin >= 0) {
+      for (int j = 0; j < s.parts; ++j) {
+        counts[i] += scratch.part(j).radix_counts[bin];
+      }
+    }
+  }
+  Scan(storage).InclusiveSum(counts, cdf);
+  int rank = s.radix_rank;
+  for (int i = 0; i < 2; ++i) {
+    int bin = 255 - int(threadIdx.x) * 2 - i;
+    if (bin >= 0 && cdf[i] >= rank && cdf[i] - counts[i] < rank) {
+      s.radix_prefix |= uint32_t(bin) << Shift;
+      s.radix_mask |= 255u << Shift;
+      s.radix_rank = rank - (cdf[i] - counts[i]);
+      // Plain BF16 logits have no remaining score bits after the second byte.
+      if (s.radix_rank == counts[i] || Round == 3 ||
+          (Round == 1 &&
+           (std::is_same<T, __nv_bfloat16>::value ||
+            std::is_same<T, ::type::bfloat16_t>::value) &&
+           reader.plain_logits)) {
+        s.radix_done = true;
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && s.radix_done) {
+    for (int j = 0; j < 4; ++j) {
+      s.radix_arrivals[j] = 0;
+    }
+  }
+}
+
+// Every retry uses the same per-token Gumbels. Discarding a rejected score
+// pivot therefore preserves the largest perturbed score in the nucleus.
+template <int Threads, bool Initial, typename T>
+__device__ inline void
+    parallel_pivot_draw(ParallelSamplingScratch const &scratch,
+                        ParallelSamplingReader<T> const &reader,
+                        ServingConfig const *cfg,
+                        int partition,
+                        bool partial) {
+  auto &s = scratch.state;
+  int begin = partial ? s.vocab * partition / s.parts : 0;
+  int end = partial ? s.vocab * (partition + 1) / s.parts : s.vocab;
+  float maximum = s.maximum, temperature = s.temperature,
+        cutoff = Initial ? 0 : s.candidate_weight;
+  uint32_t prefix = s.radix_prefix;
+  bool filtered = s.radix_done;
+  Draw draw;
+  TwoDraws draws;
+  ChooseDraw choose{temperature};
+  ChooseTwoDraws choose_two{temperature};
+  SamplingRng rng{uint64_t(cfg->seed), uint32_t(s.position)};
+  scan_logits<4>(
+      reader.logits + begin, end - begin, [&](int offset, float value) {
+        int token = begin + offset;
+        float score = reader.processed_score(token, value);
+        float weight = filtered && score_bits(score) < prefix
+                           ? 0
+                           : expf((score - maximum) / temperature);
+        if (weight > cutoff) {
+          float noise = !Initial && reader.cached_noise
+                            ? reader.cached_noise[token]
+                            : rng.gumbel(token);
+          if constexpr (Initial) {
+            if (reader.cached_noise) {
+              reader.cached_noise[token] = noise;
+            }
+            draws =
+                choose_two(draws, TwoDraws{Draw{score, noise, token}, Draw{}});
+          } else {
+            draw = choose(draw, Draw{score, noise, token});
+          }
+        }
+      });
+  if constexpr (Initial) {
+    draws = cub_block_reduce<Threads>(draws, choose_two);
+  } else {
+    draw = cub_block_reduce<Threads>(draw, choose);
+  }
+  if (partial) {
+    if (threadIdx.x == 0) {
+      scratch.part(partition).draw = Initial ? draws.first : draw;
+      if constexpr (Initial) {
+        scratch.part(partition).second_draw = draws.second;
+      }
+    }
+    if (!parallel_last_arrival(s, 0)) {
+      return;
+    }
+    if (threadIdx.x == 0) {
+      Draw best;
+      TwoDraws best_two;
+      for (int j = 0; j < s.parts; ++j) {
+        if constexpr (Initial) {
+          best_two = choose_two(
+              best_two,
+              TwoDraws{scratch.part(j).draw, scratch.part(j).second_draw});
+        } else {
+          best = choose(best, scratch.part(j).draw);
+        }
+      }
+      if constexpr (Initial) {
+        best = best_two.first;
+        s.alternate_token = best_two.second.token;
+        s.alternate_weight = reader.weight(best_two.second.token);
+      } else {
+        s.alternate_weight = 0;
+      }
+      s.token = best.token;
+      s.candidate_weight = reader.weight(best.token);
+      s.needs_check = true;
+      s.arrivals[0] = 0;
+      if constexpr (Initial) {
+        if (s.p == 1) {
+          s.done = true;
+        }
+      }
+    }
+  } else if (threadIdx.x == 0) {
+    s.token = draw.token;
+    s.candidate_weight = reader.weight(draw.token);
+    s.alternate_weight = 0;
+    s.needs_check = true;
+  }
+  __syncthreads();
+}
+// A candidate belongs to the tie-inclusive nucleus exactly when the mass
+// strictly above its weight is smaller than p times the retained total.
+template <int Threads, int Round, typename T>
+__device__ inline void
+    parallel_pivot_check(ParallelSamplingScratch const &scratch,
+                         ParallelSamplingReader<T> const &reader,
+                         int partition,
+                         bool partial) {
+  auto &s = scratch.state;
+  int begin = partial ? s.vocab * partition / s.parts : 0;
+  int end = partial ? s.vocab * (partition + 1) / s.parts : s.vocab;
+  double mass = 0, total = 0, alternate = 0;
+  float second_cutoff = s.alternate_weight;
+  float cutoff = s.candidate_weight, maximum = s.maximum,
+        temperature = s.temperature;
+  bool filtered = s.radix_done;
+  uint32_t prefix = s.radix_prefix;
+  scan_logits<4>(
+      reader.logits + begin, end - begin, [&](int offset, float value) {
+        int token = begin + offset;
+        float score = reader.processed_score(token, value);
+        float weight = filtered && score_bits(score) < prefix
+                           ? 0
+                           : expf((score - maximum) / temperature);
+        if constexpr (Round == 0) {
+          total += double(weight);
+          if (weight > cutoff) {
+            if (second_cutoff > cutoff && weight > second_cutoff) {
+              alternate += double(weight);
+            } else {
+              mass += double(weight);
+            }
+          }
+        } else if (weight > cutoff) {
+          mass += double(weight);
+        }
+      });
+  mass = cub_block_reduce<Threads>(mass, cuda::std::plus<double>{});
+  if constexpr (Round == 0) {
+    total = cub_block_reduce<Threads>(total, cuda::std::plus<double>{});
+    alternate = cub_block_reduce<Threads>(alternate, cuda::std::plus<double>{});
+  }
+  if (partial) {
+    if (threadIdx.x == 0) {
+      scratch.part(partition).above_mass = mass;
+      scratch.part(partition).total_mass = total;
+      if constexpr (Round == 0) {
+        scratch.part(partition).alternate_mass = alternate;
+      }
+    }
+    __syncthreads();
+    bool last = false;
+    if (threadIdx.x == 0) {
+      cuda::atomic_ref<int, cuda::thread_scope_device> arrivals(
+          s.radix_arrivals[Round]);
+      last = arrivals.fetch_add(1, cuda::memory_order_acq_rel) == s.parts - 1;
+    }
+    if (!__syncthreads_or(last)) {
+      return;
+    }
+    if (threadIdx.x == 0) {
+      mass = 0;
+      total = 0;
+      alternate = 0;
+      for (int j = 0; j < s.parts; ++j) {
+        mass += scratch.part(j).above_mass;
+        total += scratch.part(j).total_mass;
+        if constexpr (Round == 0) {
+          alternate += scratch.part(j).alternate_mass;
+        }
+      }
+      if constexpr (Round == 0) {
+        s.target = s.p * total;
+        mass += alternate;
+      }
+      s.needs_check = false;
+      if (mass < s.target) {
+        s.done = true;
+      } else if constexpr (Round == 0) {
+        if (second_cutoff > cutoff && alternate < s.target) {
+          s.token = s.alternate_token;
+          s.done = true;
+        } else if (second_cutoff > cutoff) {
+          s.candidate_weight = second_cutoff;
+        }
+      }
+    }
+  } else if (threadIdx.x == 0) {
+    s.needs_check = false;
+    if (mass < s.target) {
+      s.done = true;
+    }
   }
   __syncthreads();
 }
 
-// Phase 9: draw from the retained set and refine the boundary after rejection.
+// A compact-list overflow shifts radix and the first draw/check by one
+// phase. Dependency edges provide each cross-CTA synchronization point.
+template <int Threads, int Phase, typename T>
+__device__ inline void parallel_filter(ParallelSamplingScratch const &scratch,
+                                       ParallelSamplingReader<T> const &reader,
+                                       ServingConfig const *cfg,
+                                       int partition) {
+  auto &s = scratch.state;
+  if (!s.active || s.done) {
+    return;
+  }
+  if (s.pivot_top_p) {
+    if constexpr (Phase % 2 == 0) {
+      parallel_pivot_check<Threads, (Phase - 2) / 2>(
+          scratch, reader, partition, true);
+    } else {
+      parallel_pivot_draw<Threads, false>(
+          scratch, reader, cfg, partition, true);
+    }
+    return;
+  }
+  if constexpr (Phase == 2) {
+    if (s.compact_top_k) {
+      parallel_compact_top_k<Threads>(scratch, reader, cfg, partition);
+    } else {
+      parallel_radix<Threads, 0>(scratch, reader, partition);
+    }
+  } else if constexpr (Phase == 3) {
+    if (s.compact_top_k) {
+      if (s.refine_top_k) {
+        parallel_refine_top_k<Threads>(scratch, reader, cfg, partition);
+      } else {
+        parallel_radix<Threads, 0>(scratch, reader, partition);
+      }
+    } else {
+      parallel_radix<Threads, 1>(scratch, reader, partition);
+    }
+  } else if constexpr (Phase == 4) {
+    if (s.compact_top_k) {
+      parallel_radix<Threads, 1>(scratch, reader, partition);
+    } else {
+      parallel_radix<Threads, 2>(scratch, reader, partition);
+    }
+  } else if constexpr (Phase == 5) {
+    if (s.compact_top_k) {
+      parallel_radix<Threads, 2>(scratch, reader, partition);
+    } else {
+      parallel_radix<Threads, 3>(scratch, reader, partition);
+    }
+  } else if constexpr (Phase == 6) {
+    if (s.compact_top_k) {
+      parallel_radix<Threads, 3>(scratch, reader, partition);
+    } else {
+      parallel_pivot_draw<Threads, true>(scratch, reader, cfg, partition, true);
+    }
+  } else if constexpr (Phase == 7) {
+    if (s.compact_top_k) {
+      parallel_pivot_draw<Threads, true>(scratch, reader, cfg, partition, true);
+    } else {
+      parallel_pivot_check<Threads, 0>(scratch, reader, partition, true);
+    }
+  } else if constexpr (Phase == 8) {
+    if (s.compact_top_k) {
+      parallel_pivot_check<Threads, 0>(scratch, reader, partition, true);
+    } else {
+      parallel_pivot_draw<Threads, false>(
+          scratch, reader, cfg, partition, true);
+    }
+  }
+}
+
 template <int Threads, typename T>
-__device__ __noinline__ void
-    parallel_finish(ParallelSamplingScratch const &scratch,
-                    ParallelSamplingReader<T> const &reader,
-                    long long *output,
-                    ServingConfig const *cfg) {
+__device__ inline void parallel_finish(ParallelSamplingScratch const &scratch,
+                                       ParallelSamplingReader<T> const &reader,
+                                       long long *output,
+                                       ServingConfig const *cfg) {
   auto &s = scratch.state;
   if (!s.active) {
     return;
   }
+  // Fixed task phases handle the common case. Finish any remaining
+  // refinement exactly; an iteration limit must not widen the nucleus.
   while (!s.done) {
-    if (threadIdx.x == 0) {
-      parallel_choose_part(s, cfg);
-    }
-    __syncthreads();
-    parallel_draw_partition<Threads>(scratch, reader, true);
-    if (!s.done) {
-      parallel_refine<Threads>(scratch, reader);
+    if (s.needs_check) {
+      parallel_pivot_check<Threads, 1>(scratch, reader, 0, false);
+    } else {
+      parallel_pivot_draw<Threads, false>(scratch, reader, cfg, 0, false);
     }
   }
   if (threadIdx.x == 0) {
     output[s.logit_row] = s.token;
   }
 }
-
 #if defined(MODE_ONLINE_PINNED)
 template <int Threads, int Phase, typename T>
 __device__ inline void
@@ -1200,7 +1395,8 @@ __device__ inline void
                    mirage::runtime::RuntimeConfig const &config) {
   ParallelSamplingScratch scratch(
       buffer + slot * parallel_sampling_scratch_words(padded_vocab, parts),
-      padded_vocab, parts);
+      padded_vocab,
+      parts);
   auto &s = scratch.state;
   if constexpr (Phase == SAMPLE_PREPARE) {
     int row = config.request_ids[slot];
@@ -1223,36 +1419,26 @@ __device__ inline void
                      end - 1,
                      padded_vocab,
                      parts,
-                     active);
+                     active,
+                     config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);
   } else {
-    if (!s.active) {
+    if (!s.active || (Phase < SAMPLE_FINISH && partition >= s.parts)) {
       return;
     }
     auto *cfg = config.generation_config + s.row;
     auto *row_logits = logits + s.logit_row * padded_vocab;
-    auto *row_history = history_buffer +
-                        s.row * sampling_scratch_words(padded_vocab);
+    auto *row_history =
+        history_buffer + s.row * sampling_scratch_words(padded_vocab);
     if constexpr (Phase == SAMPLE_SCORES) {
-      parallel_scores<Threads>(row_logits,
-                               row_history,
-                               scratch,
-                               cfg,
-                               partition,
-                               padded_vocab);
+      parallel_scores<Threads>(
+          row_logits, row_history, scratch, cfg, partition, padded_vocab);
     } else {
-      ParallelSamplingReader reader(row_logits, row_history, padded_vocab, cfg,
-                                    s);
-      if constexpr (Phase == SAMPLE_COARSE_FILTER) {
-        parallel_coarse_filter<Threads>(scratch, reader, cfg, partition);
-      } else if constexpr (Phase >= SAMPLE_RADIX_0 && Phase <= SAMPLE_RADIX_3) {
-        parallel_radix_top_k<Threads, Phase - SAMPLE_RADIX_0>(scratch, reader,
-                                                              partition);
-      } else if constexpr (Phase == SAMPLE_MASKED_FILTER) {
-        parallel_coarse_filter<Threads>(scratch, reader, cfg, partition, true);
-      } else if constexpr (Phase == SAMPLE_COLLECT) {
-        parallel_collect<Threads>(scratch, reader, partition);
-      } else if constexpr (Phase == SAMPLE_FINISH) {
+      ParallelSamplingReader reader(
+          row_logits, row_history, padded_vocab, cfg, s);
+      if constexpr (Phase == SAMPLE_FINISH) {
         parallel_finish<Threads>(scratch, reader, output, cfg);
+      } else {
+        parallel_filter<Threads, Phase>(scratch, reader, cfg, partition);
       }
     }
   }

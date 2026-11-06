@@ -2671,7 +2671,8 @@ class PersistentKernel:
             raise ValueError("serving_sampling_layer requires online_pinned mode")
         vocab_size = logits.dim(1)
         if num_ctas is None:
-            num_ctas = min(16, max(8, (vocab_size + 8191) // 8192))
+            cta_limit = 32 if self.max_num_batched_requests <= 4 else 16
+            num_ctas = min(cta_limit, max(8, (vocab_size + 4095) // 4096))
         if not 2 <= num_ctas <= 32:
             raise ValueError("sampling num_ctas must be between 2 and 32")
         scratch = self.new_tensor(
@@ -2686,7 +2687,7 @@ class PersistentKernel:
             name="serving_sampling_parallel_scratch",
         )
         previous = None
-        # Prepare, score, coarse filter, refine large top-k, collect, finish.
+        # Prepare, propose, select/refine, check retained mass, and finish.
         # Per-request dependency edges join partition tasks between phases.
         for phase in range(10):
             final = phase == 9
