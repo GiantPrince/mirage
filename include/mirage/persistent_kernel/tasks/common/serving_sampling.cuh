@@ -287,7 +287,7 @@ struct SamplingScoreReader {
 };
 
 // Vector loads avoid a second logit read when penalties or biases are applied.
-template <int Width = 16, typename T, typename Visit>
+template <int Width, typename T, typename Visit>
 __device__ inline void scan_logits(T const *logits, int vocab, Visit visit) {
   for (int base = Width * threadIdx.x; base < vocab;
        base += Width * blockDim.x) {
@@ -420,9 +420,6 @@ struct ParallelSamplingReader {
   __device__ float processed_score(int token) const {
     return processed_score(token, float(logits[token]));
   }
-  __device__ float scaled_score(int token) const {
-    return (processed_score(token) - state.maximum) / state.temperature;
-  }
   __device__ float weight(int token) const {
     float score = processed_score(token);
     if (state.radix_done && score_bits(score) < state.radix_prefix) {
@@ -466,7 +463,6 @@ __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
     s.logit_row = logit_row;
     s.position = position;
     s.parts = parts;
-    s.token = INT_MAX;
     if (active) {
       s.vocab = min(padded_vocab, int(cfg->vocab_size));
       s.k = cfg->top_k > 0 && cfg->top_k < s.vocab ? int(cfg->top_k) : 0;
@@ -515,7 +511,7 @@ __device__ __noinline__ void
                     int partition,
                     int padded_vocab) {
   auto &s = scratch.state;
-  if (!s.active || s.done) {
+  if (s.done) {
     return;
   }
   ParallelSamplingReader reader(logits, history_scratch, padded_vocab, cfg, s);
@@ -526,7 +522,7 @@ __device__ __noinline__ void
   int begin = s.vocab * partition / s.parts,
       end = s.vocab * (partition + 1) / s.parts;
   uint64_t best = 0, second = 0;
-  // Each partition supplies at most two distinct scores to the bound.
+  // Each partition supplies at most two top-scoring tokens to the bound.
   bool compact_top_k = !greedy && s.k && s.k <= 2 * s.parts;
   Draw draw;
   ChooseDraw choose{s.temperature};
@@ -640,7 +636,6 @@ __device__ __noinline__ void
   }
 }
 
-template <int Threads>
 __device__ inline int const *
     parallel_candidate_offsets(ParallelSamplingScratch const &scratch) {
   auto &s = scratch.state;
@@ -776,7 +771,7 @@ __device__ inline void
   }
 }
 
-template <int Threads, typename T>
+template <typename T>
 __device__ inline void
     parallel_sample_candidates(ParallelSamplingScratch const &scratch,
                                ParallelSamplingReader<T> const &reader,
@@ -847,9 +842,9 @@ __device__ inline void
   if (!parallel_last_arrival(s, 2)) {
     return;
   }
-  int const *offsets = parallel_candidate_offsets<Threads>(scratch);
+  int const *offsets = parallel_candidate_offsets(scratch);
   if (offsets[s.parts] <= 64) {
-    parallel_sample_candidates<Threads>(scratch, reader, cfg, offsets);
+    parallel_sample_candidates(scratch, reader, cfg, offsets);
     return;
   }
   // Cache the small relative-score histograms before combining them.
@@ -937,8 +932,8 @@ __device__ inline void
   if (!parallel_last_arrival(s, 2)) {
     return;
   }
-  int const *offsets = parallel_candidate_offsets<Threads>(scratch);
-  parallel_sample_candidates<Threads>(scratch, reader, cfg, offsets);
+  int const *offsets = parallel_candidate_offsets(scratch);
+  parallel_sample_candidates(scratch, reader, cfg, offsets);
 }
 
 // A radix pass counts one score byte across the vocabulary partitions. The
@@ -1159,7 +1154,9 @@ __device__ inline void
   if (partial) {
     if (threadIdx.x == 0) {
       scratch.part(partition).above_mass = mass;
-      scratch.part(partition).total_mass = total;
+      if constexpr (Round == 0) {
+        scratch.part(partition).total_mass = total;
+      }
     }
     __syncthreads();
     bool last = false;
@@ -1173,12 +1170,14 @@ __device__ inline void
     }
     if (threadIdx.x == 0) {
       mass = 0;
-      total = 0;
       for (int j = 0; j < s.parts; ++j) {
         mass += scratch.part(j).above_mass;
-        total += scratch.part(j).total_mass;
       }
       if constexpr (Round == 0) {
+        total = 0;
+        for (int j = 0; j < s.parts; ++j) {
+          total += scratch.part(j).total_mass;
+        }
         s.target = s.p * total;
       }
       s.needs_check = false;
@@ -1195,15 +1194,32 @@ __device__ inline void
   __syncthreads();
 }
 
-// A compact-list overflow shifts radix and the first draw/check by one
-// phase. Dependency edges provide each cross-CTA synchronization point.
+// Four radix bytes are followed by the initial draw, mass check, and retry.
+// A compact-list overflow starts this sequence one phase later.
+template <int Threads, int Phase, int RadixStart, typename T>
+__device__ inline void
+    parallel_top_k_phase(ParallelSamplingScratch const &scratch,
+                         ParallelSamplingReader<T> const &reader,
+                         ServingConfig const *cfg,
+                         int partition) {
+  if constexpr (Phase >= RadixStart && Phase < RadixStart + 4) {
+    parallel_radix<Threads, Phase - RadixStart>(scratch, reader, partition);
+  } else if constexpr (Phase == RadixStart + 4) {
+    parallel_pivot_draw<Threads, true>(scratch, reader, cfg, partition, true);
+  } else if constexpr (Phase == RadixStart + 5) {
+    parallel_pivot_check<Threads, 0>(scratch, reader, partition, true);
+  } else if constexpr (Phase == RadixStart + 6) {
+    parallel_pivot_draw<Threads, false>(scratch, reader, cfg, partition, true);
+  }
+}
+
 template <int Threads, int Phase, typename T>
 __device__ inline void parallel_filter(ParallelSamplingScratch const &scratch,
                                        ParallelSamplingReader<T> const &reader,
                                        ServingConfig const *cfg,
                                        int partition) {
   auto &s = scratch.state;
-  if (!s.active || s.done) {
+  if (s.done) {
     return;
   }
   if (s.pivot_top_p) {
@@ -1219,50 +1235,18 @@ __device__ inline void parallel_filter(ParallelSamplingScratch const &scratch,
   if constexpr (Phase == 2) {
     if (s.compact_top_k) {
       parallel_compact_top_k<Threads>(scratch, reader, cfg, partition);
-    } else {
-      parallel_radix<Threads, 0>(scratch, reader, partition);
+      return;
     }
   } else if constexpr (Phase == 3) {
-    if (s.compact_top_k) {
-      if (s.refine_top_k) {
-        parallel_refine_top_k<Threads>(scratch, reader, cfg, partition);
-      } else {
-        parallel_radix<Threads, 0>(scratch, reader, partition);
-      }
-    } else {
-      parallel_radix<Threads, 1>(scratch, reader, partition);
+    if (s.compact_top_k && s.refine_top_k) {
+      parallel_refine_top_k<Threads>(scratch, reader, cfg, partition);
+      return;
     }
-  } else if constexpr (Phase == 4) {
-    if (s.compact_top_k) {
-      parallel_radix<Threads, 1>(scratch, reader, partition);
-    } else {
-      parallel_radix<Threads, 2>(scratch, reader, partition);
-    }
-  } else if constexpr (Phase == 5) {
-    if (s.compact_top_k) {
-      parallel_radix<Threads, 2>(scratch, reader, partition);
-    } else {
-      parallel_radix<Threads, 3>(scratch, reader, partition);
-    }
-  } else if constexpr (Phase == 6) {
-    if (s.compact_top_k) {
-      parallel_radix<Threads, 3>(scratch, reader, partition);
-    } else {
-      parallel_pivot_draw<Threads, true>(scratch, reader, cfg, partition, true);
-    }
-  } else if constexpr (Phase == 7) {
-    if (s.compact_top_k) {
-      parallel_pivot_draw<Threads, true>(scratch, reader, cfg, partition, true);
-    } else {
-      parallel_pivot_check<Threads, 0>(scratch, reader, partition, true);
-    }
-  } else if constexpr (Phase == 8) {
-    if (s.compact_top_k) {
-      parallel_pivot_check<Threads, 0>(scratch, reader, partition, true);
-    } else {
-      parallel_pivot_draw<Threads, false>(
-          scratch, reader, cfg, partition, true);
-    }
+  }
+  if (s.compact_top_k) {
+    parallel_top_k_phase<Threads, Phase, 3>(scratch, reader, cfg, partition);
+  } else {
+    parallel_top_k_phase<Threads, Phase, 2>(scratch, reader, cfg, partition);
   }
 }
 
@@ -1272,9 +1256,6 @@ __device__ inline void parallel_finish(ParallelSamplingScratch const &scratch,
                                        long long *output,
                                        ServingConfig const *cfg) {
   auto &s = scratch.state;
-  if (!s.active) {
-    return;
-  }
   // Fixed task phases handle the common case. Finish any remaining
   // refinement exactly; an iteration limit must not widen the nucleus.
   while (!s.done) {
@@ -1328,7 +1309,7 @@ __device__ inline void
                      parts,
                      active);
   } else {
-    if (!s.active || (Phase < SAMPLE_FINISH && partition >= s.parts)) {
+    if (!s.active) {
       return;
     }
     auto *cfg = config.generation_config + s.row;

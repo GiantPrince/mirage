@@ -59,18 +59,18 @@ constexpr int FINISH_NONE = 0;
 constexpr int FINISH_STOP = 1;
 constexpr int FINISH_LENGTH = 2;
 
-// One sampler state row and one histogram/candidate slab per partition.
 constexpr int PARALLEL_SAMPLING_MAX_PARTS = 32;
-// exp((score - max) / temperature) is in [0, 1]: its high byte is 0..63.
-constexpr int PARALLEL_SAMPLING_MASS_BINS = 64;
+// Scratch strides are counts of 32-bit words shared by the host extension
+// and generated CUDA tasks. Keep these reserved strides stable when changing
+// device structs; serving_sampling.cuh checks that the structs fit.
 constexpr int PARALLEL_SAMPLING_STATE_WORDS = 256;
-// 128 coarse buckets each hold one count and one 64-bit significand.
-constexpr int PARALLEL_SAMPLING_PART_WORDS = 16 + 6 * PARALLEL_SAMPLING_MASS_BINS;
-// Preserve the history scratch stride used by the host extension. The old
-// workspace is unused by the multi-CTA sampler, but changing this stride
-// requires rebuilding both the extension and every compiled serving task.
+// Per-partition storage holds maxima, a draw, mass sums, and 256 radix counts.
+// The remaining words are reserved to preserve the existing allocation ABI.
+constexpr int PARALLEL_SAMPLING_PART_WORDS = 400;
+// The history cursor follows a legacy reserved area after the two bitsets.
+// Reserve one cursor word and one padding word for an eight-byte row stride.
 constexpr int HISTORY_CURSOR_OFFSET_WORDS = 256;
-constexpr int HISTORY_SCRATCH_RESERVED_WORDS = 258;
+constexpr int HISTORY_SCRATCH_RESERVED_WORDS = HISTORY_CURSOR_OFFSET_WORDS + 2;
 
 #ifdef __CUDACC__
 __host__ __device__

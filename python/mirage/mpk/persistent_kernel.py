@@ -2688,6 +2688,8 @@ class PersistentKernel:
         previous = None
         # Prepare, propose, select/refine, check retained mass, and finish.
         # Per-request dependency edges join partition tasks between phases.
+        # Filters are chosen per request at runtime, so startup sampling
+        # defaults cannot safely select a shorter graph. Done requests return.
         for phase in range(10):
             final = phase == 9
             result = output if final else self.new_tensor(
