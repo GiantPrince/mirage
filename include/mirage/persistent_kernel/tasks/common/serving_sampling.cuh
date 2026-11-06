@@ -70,23 +70,6 @@ struct ChooseDraw {
   }
 };
 
-// The first two perturbed-score winners share one RNG pass. Both may be
-// checked against the nucleus in the following parallel reduction.
-struct TwoDraws {
-  Draw first, second;
-};
-struct ChooseTwoDraws {
-  float temperature;
-  __device__ TwoDraws operator()(TwoDraws a, TwoDraws b) const {
-    ChooseDraw choose{temperature};
-    Draw winner = choose(a.first, b.first);
-    if (winner.token == a.first.token && winner.score == a.first.score) {
-      return {winner, choose(a.second, b.first)};
-    }
-    return {winner, choose(b.second, a.first)};
-  }
-};
-
 constexpr int PARALLEL_SAMPLING_SHARED_BYTES = 16 * 1024;
 // Reserve the final 2 KiB of shared memory for CUB reductions.
 constexpr int CUB_STORAGE_OFFSET_BYTES = 14 * 1024;
@@ -341,14 +324,12 @@ struct ParallelSamplingState {
   bool radix_done, compact_top_k, pivot_top_p, needs_check, refine_top_k;
   int prefilter_bucket;
   float maximum, temperature, candidate_weight, candidate_score;
-  float alternate_weight;
-  int alternate_token;
   double p, target;
 };
 struct ParallelSamplingPart {
   uint64_t best, second;
-  Draw draw, second_draw;
-  double above_mass, total_mass, alternate_mass;
+  Draw draw;
+  double above_mass, total_mass;
   int candidate_count;
   uint32_t radix_counts[256];
 };
@@ -476,8 +457,7 @@ __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
                                         int logit_row,
                                         int padded_vocab,
                                         int parts,
-                                        bool active,
-                                        int batch_size = 1) {
+                                        bool active) {
   auto &s = scratch.state;
   if (threadIdx.x == 0) {
     s = ParallelSamplingState{};
@@ -495,11 +475,6 @@ __device__ inline void parallel_prepare(ParallelSamplingScratch const &scratch,
       s.p = cfg->top_p;
       s.pivot_top_p =
           !s.k && cfg->top_k != 1 && cfg->temperature > 0 && s.p < 1;
-      // Large pure top-p batches supply parallelism across rows; fewer
-      // partitions reduce the cost of their per-row reductions.
-      if (s.pivot_top_p && batch_size >= 24) {
-        s.parts = min(parts, 8);
-      }
     }
   }
   __syncthreads();
@@ -530,7 +505,7 @@ struct ChooseTopTwo {
 };
 
 // Phase 1: process logits and find maxima, a safe top-k score bound, or the
-// first two Gumbel proposals. Greedy and unfiltered draws finish here.
+// first Gumbel proposal. Greedy and unfiltered draws finish here.
 template <int Threads, typename T>
 __device__ __noinline__ void
     parallel_scores(T const *logits,
@@ -551,11 +526,10 @@ __device__ __noinline__ void
   int begin = s.vocab * partition / s.parts,
       end = s.vocab * (partition + 1) / s.parts;
   uint64_t best = 0, second = 0;
+  // Each partition supplies at most two distinct scores to the bound.
   bool compact_top_k = !greedy && s.k && s.k <= 2 * s.parts;
   Draw draw;
-  TwoDraws draws;
   ChooseDraw choose{s.temperature};
-  ChooseTwoDraws choose_two{s.temperature};
   SamplingRng rng{uint64_t(cfg->seed), uint32_t(s.position)};
   scan_logits<4>(logits + begin, end - begin, [&](int offset, float logit) {
     int v = begin + offset;
@@ -570,11 +544,7 @@ __device__ __noinline__ void
       if (pivot_top_p && reader.cached_noise) {
         reader.cached_noise[v] = noise;
       }
-      if (pivot_top_p) {
-        draws = choose_two(draws, TwoDraws{Draw{score, noise, v}, Draw{}});
-      } else {
-        draw = choose(draw, Draw{score, noise, v});
-      }
+      draw = choose(draw, Draw{score, noise, v});
     }
   });
   if (compact_top_k && s.k > s.parts) {
@@ -584,19 +554,13 @@ __device__ __noinline__ void
   } else {
     best = cub_block_reduce<Threads>(best, Maximum{});
   }
-  if (pivot_top_p) {
-    draws = cub_block_reduce<Threads>(draws, choose_two);
-    draw = draws.first;
-  } else if (draw_token) {
+  if (draw_token) {
     draw = cub_block_reduce<Threads>(draw, choose);
   }
   if (threadIdx.x == 0) {
     scratch.part(partition).best = best;
     scratch.part(partition).second = second;
     scratch.part(partition).draw = draw;
-    if (pivot_top_p) {
-      scratch.part(partition).second_draw = draws.second;
-    }
   }
   if (!parallel_last_arrival(s, 1)) {
     return;
@@ -644,9 +608,6 @@ __device__ __noinline__ void
     best = 0;
     uint64_t pivot = UINT64_MAX;
     Draw winner;
-    if (pivot_top_p) {
-      draws = TwoDraws{};
-    }
     for (int j = 0; j < s.parts; ++j) {
       auto &part = scratch.part(j);
       if (compact_top_k) {
@@ -655,9 +616,7 @@ __device__ __noinline__ void
       if (part.best > best) {
         best = part.best;
       }
-      if (pivot_top_p) {
-        draws = choose_two(draws, TwoDraws{part.draw, part.second_draw});
-      } else if (draw_token) {
+      if (draw_token) {
         winner = choose(winner, part.draw);
       }
     }
@@ -669,12 +628,9 @@ __device__ __noinline__ void
       s.compact_top_k = isfinite(s.candidate_score);
     }
     if (pivot_top_p) {
-      s.token = draws.first.token;
+      s.token = winner.token;
       s.candidate_weight =
-          expf((draws.first.score - s.maximum) / s.temperature);
-      s.alternate_token = draws.second.token;
-      s.alternate_weight =
-          expf((draws.second.score - s.maximum) / s.temperature);
+          expf((winner.score - s.maximum) / s.temperature);
       s.needs_check = true;
     }
     if (greedy || !isfinite(s.maximum) || unfiltered) {
@@ -712,6 +668,7 @@ __device__ inline int const *
 
 // The vocabulary scan is distributed; only this bounded candidate set
 // needs a final warp-local sort and categorical draw.
+// Its capacity is 32 lanes times two keys per lane, not a tuning threshold.
 template <typename T>
 __device__ inline void
     parallel_sort_warp(ParallelSamplingScratch const &scratch,
@@ -1114,9 +1071,7 @@ __device__ inline void
   uint32_t prefix = s.radix_prefix;
   bool filtered = s.radix_done;
   Draw draw;
-  TwoDraws draws;
   ChooseDraw choose{temperature};
-  ChooseTwoDraws choose_two{temperature};
   SamplingRng rng{uint64_t(cfg->seed), uint32_t(s.position)};
   scan_logits<4>(
       reader.logits + begin, end - begin, [&](int offset, float value) {
@@ -1133,46 +1088,22 @@ __device__ inline void
             if (reader.cached_noise) {
               reader.cached_noise[token] = noise;
             }
-            draws =
-                choose_two(draws, TwoDraws{Draw{score, noise, token}, Draw{}});
-          } else {
-            draw = choose(draw, Draw{score, noise, token});
           }
+          draw = choose(draw, Draw{score, noise, token});
         }
       });
-  if constexpr (Initial) {
-    draws = cub_block_reduce<Threads>(draws, choose_two);
-  } else {
-    draw = cub_block_reduce<Threads>(draw, choose);
-  }
+  draw = cub_block_reduce<Threads>(draw, choose);
   if (partial) {
     if (threadIdx.x == 0) {
-      scratch.part(partition).draw = Initial ? draws.first : draw;
-      if constexpr (Initial) {
-        scratch.part(partition).second_draw = draws.second;
-      }
+      scratch.part(partition).draw = draw;
     }
     if (!parallel_last_arrival(s, 0)) {
       return;
     }
     if (threadIdx.x == 0) {
       Draw best;
-      TwoDraws best_two;
       for (int j = 0; j < s.parts; ++j) {
-        if constexpr (Initial) {
-          best_two = choose_two(
-              best_two,
-              TwoDraws{scratch.part(j).draw, scratch.part(j).second_draw});
-        } else {
-          best = choose(best, scratch.part(j).draw);
-        }
-      }
-      if constexpr (Initial) {
-        best = best_two.first;
-        s.alternate_token = best_two.second.token;
-        s.alternate_weight = reader.weight(best_two.second.token);
-      } else {
-        s.alternate_weight = 0;
+        best = choose(best, scratch.part(j).draw);
       }
       s.token = best.token;
       s.candidate_weight = reader.weight(best.token);
@@ -1187,7 +1118,6 @@ __device__ inline void
   } else if (threadIdx.x == 0) {
     s.token = draw.token;
     s.candidate_weight = reader.weight(draw.token);
-    s.alternate_weight = 0;
     s.needs_check = true;
   }
   __syncthreads();
@@ -1203,8 +1133,7 @@ __device__ inline void
   auto &s = scratch.state;
   int begin = partial ? s.vocab * partition / s.parts : 0;
   int end = partial ? s.vocab * (partition + 1) / s.parts : s.vocab;
-  double mass = 0, total = 0, alternate = 0;
-  float second_cutoff = s.alternate_weight;
+  double mass = 0, total = 0;
   float cutoff = s.candidate_weight, maximum = s.maximum,
         temperature = s.temperature;
   bool filtered = s.radix_done;
@@ -1218,29 +1147,19 @@ __device__ inline void
                            : expf((score - maximum) / temperature);
         if constexpr (Round == 0) {
           total += double(weight);
-          if (weight > cutoff) {
-            if (second_cutoff > cutoff && weight > second_cutoff) {
-              alternate += double(weight);
-            } else {
-              mass += double(weight);
-            }
-          }
-        } else if (weight > cutoff) {
+        }
+        if (weight > cutoff) {
           mass += double(weight);
         }
       });
   mass = cub_block_reduce<Threads>(mass, cuda::std::plus<double>{});
   if constexpr (Round == 0) {
     total = cub_block_reduce<Threads>(total, cuda::std::plus<double>{});
-    alternate = cub_block_reduce<Threads>(alternate, cuda::std::plus<double>{});
   }
   if (partial) {
     if (threadIdx.x == 0) {
       scratch.part(partition).above_mass = mass;
       scratch.part(partition).total_mass = total;
-      if constexpr (Round == 0) {
-        scratch.part(partition).alternate_mass = alternate;
-      }
     }
     __syncthreads();
     bool last = false;
@@ -1255,28 +1174,16 @@ __device__ inline void
     if (threadIdx.x == 0) {
       mass = 0;
       total = 0;
-      alternate = 0;
       for (int j = 0; j < s.parts; ++j) {
         mass += scratch.part(j).above_mass;
         total += scratch.part(j).total_mass;
-        if constexpr (Round == 0) {
-          alternate += scratch.part(j).alternate_mass;
-        }
       }
       if constexpr (Round == 0) {
         s.target = s.p * total;
-        mass += alternate;
       }
       s.needs_check = false;
       if (mass < s.target) {
         s.done = true;
-      } else if constexpr (Round == 0) {
-        if (second_cutoff > cutoff && alternate < s.target) {
-          s.token = s.alternate_token;
-          s.done = true;
-        } else if (second_cutoff > cutoff) {
-          s.candidate_weight = second_cutoff;
-        }
       }
     }
   } else if (threadIdx.x == 0) {
@@ -1419,8 +1326,7 @@ __device__ inline void
                      end - 1,
                      padded_vocab,
                      parts,
-                     active,
-                     config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);
+                     active);
   } else {
     if (!s.active || (Phase < SAMPLE_FINISH && partition >= s.parts)) {
       return;

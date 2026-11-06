@@ -2671,8 +2671,7 @@ class PersistentKernel:
             raise ValueError("serving_sampling_layer requires online_pinned mode")
         vocab_size = logits.dim(1)
         if num_ctas is None:
-            cta_limit = 32 if self.max_num_batched_requests <= 4 else 16
-            num_ctas = min(cta_limit, max(8, (vocab_size + 4095) // 4096))
+            num_ctas = min(32, max(8, (vocab_size + 4095) // 4096))
         if not 2 <= num_ctas <= 32:
             raise ValueError("sampling num_ctas must be between 2 and 32")
         scratch = self.new_tensor(
